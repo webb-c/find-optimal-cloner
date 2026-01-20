@@ -39,12 +39,9 @@ class SolverSDP(Solver):
         
         I_in = np.eye(self.d_in, dtype=complex)
         I_out = np.eye(self.d_out, dtype=complex)
-        for i in range(self.d_in):
-            for j in range(self.d_in):
-                s = 0
-                for a in range(self.d_out):
-                    s += J[a * self.d_in + i, a * self.d_in + j]
-                constraints += [s == I_in[i, j]]
+        
+        ptr_J = cp.partial_trace(J, (self.d_out, self.d_in), axis=0)
+        constraints += [ptr_J == I_in]
         
         I2, X, Y, Z = qubit_paulis()
         Sx_out = collective_spin(X, n_qubits=self.n_out)
@@ -53,6 +50,7 @@ class SolverSDP(Solver):
         Sx_in = collective_spin(X, n_qubits=self.n_in)
         Sy_in = collective_spin(Y, n_qubits=self.n_in)
         Sz_in = collective_spin(Z, n_qubits=self.n_in)
+        
         gens = [(Sx_out, Sx_in), (Sy_out, Sy_in), (Sz_out, Sz_in)]
         for (S_out, S_in) in gens:
             A = np.kron(S_out, I_in) - np.kron(I_out, S_in.T)
@@ -65,26 +63,17 @@ class SolverSDP(Solver):
             ideal_rho_out = rho_tensor_power(rho, self.n_out)  
             alpha_c = cp.Constant(ideal_rho_out)
             
-            K = cp.Constant(np.kron(I_out, rho_in.T))  
-            M = K @ J                               
+            K = cp.Constant(np.kron(I_out, rho_in.T))
+            M = K @ J
             
-            sigma_blocks = []
-            for a in range(self.d_out):
-                row = []
-                for b in range(self.d_out):
-                    expr = 0
-                    for i in range(self.d_in):
-                        expr += M[a * self.d_in + i, b * self.d_in + i]
-                    row.append(expr)
-                sigma_blocks.append(row)
-            sigma = cp.bmat(sigma_blocks)
+            sigma = cp.partial_trace(M, (self.d_out, self.d_in), axis=1)
             sigma = (sigma + sigma.H) / 2 
 
             Xk = cp.Variable((self.d_out, self.d_out), complex=True)
             X_vars.append(Xk)
 
             block = cp.bmat([[alpha_c, Xk],
-                            [Xk.H,    sigma]])
+                                [Xk.H,    sigma]])
             constraints += [block >> 0]
             constraints += [cp.real(cp.trace(Xk)) >= t]
 
