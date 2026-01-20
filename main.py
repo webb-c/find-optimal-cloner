@@ -11,9 +11,9 @@ def parse_args():
     parser.add_argument("--n_out", type=int, default=4, help="Number of output clones.")
     parser.add_argument("--dim", type=int, default=2, help="Dimension of each qubit.")
     parser.add_argument("--method", type=str, default="sdp", choices=["sdp_fix", "sdp"], help="Optimization method.")
-    parser.add_argument("--p_init_grid", type=int, default=21, help="Number of p grid points for fixed method. (20 - 50 recommended)")
+    parser.add_argument("--p_init_grid", type=int, default=21, help="Number of p grid points for sdp method. (20 - 50 recommended)")
     parser.add_argument("--p_fine_grid", type=int, default=301, help="Number of p grid points for refinement. (300 - 500 recommended)")
-    parser.add_argument("--n_rounds", type=int, default=3, help="Number of refinement rounds for fixed method. (3 - 5 recommended)")
+    parser.add_argument("--n_rounds", type=int, default=3, help="Number of refinement rounds for sdp method. (3 - 5 recommended)")
     
     parser.add_argument("--verify", type=str2bool, default=False, help="Whether to run verification after optimization.")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of input sample states. (each pure, mix)")
