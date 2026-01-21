@@ -173,3 +173,7 @@ def apply_choi_numpy(J, rho, d_out, d_in):
     if abs(tr) > 1e-15:
         sigma = sigma / tr
     return sigma
+
+def save_choi_blocks(filename: str, j_blocks: dict):
+    save_dict = {str(k): v for k, v in j_blocks.items()}
+    np.savez_compressed(filename, **save_dict)

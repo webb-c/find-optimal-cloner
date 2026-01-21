@@ -41,13 +41,22 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
-    J = solver.get_solution()
+    if args.method in ["sdp", "sdp_fix"]:
+        J = solver.get_solution()
+    else:
+        J = solver.get_solution_blocks()
+        
     if args.verify:
         verifier = Verifier(n_pure_samples=args.n_samples, n_mixed_samples=args.n_samples, dim=args.dim, n_in=args.n_in, n_out=args.n_out, choi_matrix=J)
         verifier.verify()
         
     if args.save_data:
         os.makedirs(f"data/{args.method}", exist_ok=True)
-        filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npy"
-        np.save(filepath, J)
+        if args.method in ["sdp", "sdp_fix"]:
+            filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npy"
+            np.save(filepath, J)
+        else:
+            filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npz"
+            save_choi_blocks(filepath, J)
+        
         print(f"Saved J_opt to {filepath}")
