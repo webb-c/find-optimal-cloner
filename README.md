@@ -41,29 +41,35 @@ python main.py --n_in <N> --n_out <M> [options]
 **1. Optimize a 2 to 3 cloner and verify the result:**
 
 ```bash
-python main.py --n_in 2 --n_out 3 --method sdp --verify True
+python main.py --n_in 2 --n_out 3 --method sdp_perm --verify True
 ```
 
-**2. Optimize a 1 to 2 cloner with specific grid settings:**
+**2. Optimize a 2 to 3 cloner and without the verify:**
 
 ```bash
-python main.py --n_in 1 --n_out 2 --p_init_grid 20 --n_rounds 5
+python main.py --n_in 2 --n_out 3 --method sdp_perm
 ```
 
-**3. Optimize a 1 to 5 cloner by using fixed point optimizer:**
+**3. Optimize a 1 to 2 cloner with specific grid settings:**
 
 ```bash
-python main.py --n_in 1 --n_out 5 --method sdp_fix
+python main.py --n_in 1 --n_out 2 --method sdp_perm --p_init_grid 20 --n_rounds 5
+```
+
+**4. Optimize a 1 to 5 cloner by using fixed point optimizer:**
+
+```bash
+python main.py --n_in 1 --n_out 5 --method sdp_perm_fix
 ```
 
 ### Arguments
 
 | Argument | Default | Description |
 | :--- | :--- | :--- |
-| `--n_in` | `4` | Number of input copies ($N$). |
+| `--n_in` | `1` | Number of input copies ($N$). |
 | `--n_out` | `4` | Number of output copies ($M$). |
 | `--dim` | `2` | Dimension of the quantum system (currently fixed to 2 for qubits). |
-| `--method` | `sdp` | Optimization method: `sdp` (iterative) or `sdp_fix` (endpoints (i.e., pure and maximally mixed) only). |
+| `--method` | `sdp_perm` | Optimization method: `sdp` (iterative) or `sdp_fix` (endpoints (i.e., pure and maximally mixed) only), and `sdp_perm` or `sdp_perm_fix`. |
 | `--p_init_grid` | `21` | Number of p grid points for sdp method. 
 | `--p_fine_grid` | `301` | Number of p grid points for refinement stage.
 | `--n_rounds` | `3` | Number of refinement rounds for sdp method. 

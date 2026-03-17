@@ -310,8 +310,7 @@ class SolverSDPPerm(Solver):
                 print(f"         worst on fine grid: p={p_worst:.6f}, rootF={f_worst:.8f} (F≈{f_worst**2:.8f})")
 
             best = (t_opt, J_opt, list(self.p_samples), p_worst, f_worst)
-
-            # add worst p if new
+            
             if min(abs(p_worst - np.array(self.p_samples))) < 1e-6:
                 break
             self.p_samples.append(p_worst)
