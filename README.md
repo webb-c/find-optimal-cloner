@@ -13,6 +13,8 @@ $$ \mathcal{T}_{\text{opt}} = \argmax_{\mathcal{T} \text{ : CPTP}} \inf_{\rho \t
   - `Solver`: Abstract class for solvers.
   - `SolverSDP`: Implements the iterative cutting-plane method to optimize over the range of purities.
   - `SolverSDPTwoPoint` : SolverSDP with using just two points (pure state, maximally mixed state).
+  - `SolverSDPPerm`: Improve the efficiency of `SolverSDP`, using the block diagonal matrices representation.
+  - `SolverSDPPermTwoPoint`: SolverSDPPermTwoPoint with using just two points (pure state, maximally mixed state).
 - `verifier.py`: Tools to verify the solution against random pure and mixed states.
 - `utils.py`: Utility functions for quantum information operations (Pauli matrices, tensor products, fidelity, etc.).
 
