@@ -291,7 +291,7 @@ class SolverSDPPerm(Solver):
 
         best = None
         for it in range(self.n_rounds):
-            t_opt, J_opt = self.solve_one_round()
+            t_opt, J_opt = self.solve_one_round() # call self.make_problem() in this method; and self.make_problem() uses self.p_samples.
 
             # evaluate on fine grid
             p_fine = np.linspace(0.5, 1.0, self.p_fine_grid)
@@ -483,4 +483,20 @@ class SolverSDPPerm(Solver):
 class SolverSDPPermTwoPoint(SolverSDPPerm):
     def __init__(self, n_in, n_out, dim=2, verbose=False):
         super().__init__(n_in, n_out, dim, verbose, p_init_grid=2, p_fine_grid=1, n_rounds=1)
-        
+
+
+class SolverSDPPermSpectrum(SolverSDPPerm):
+    def __init__(self, n_in, n_out, dim=2, verbose=False, spectrum=None):
+        super().__init__(n_in, n_out, dim, verbose, p_init_grid=1, p_fine_grid=1, n_rounds=1)
+        self.spectrum = spectrum
+
+    # override
+    def solve(self):
+        self.p_samples = [self.spectrum]
+
+        t_opt, J_opt = self.solve_one_round() # call self.make_problem() in this method; and self.make_problem() uses self.p_samples.
+        sigma_blocks = self._apply_channel_blocks_numpy(J_opt, float(self.spectrum))
+        fvals = (self._root_fidelity_full_numpy(float(self.spectrum), sigma_blocks))
+        best = (t_opt, J_opt, self.p_samples, self.p_samples[0], fvals)
+
+        return best[1]

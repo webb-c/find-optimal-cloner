@@ -15,6 +15,8 @@ def parse_args():
     parser.add_argument("--p_fine_grid", type=int, default=301, help="Number of p grid points for refinement. (300 - 500 recommended)")
     parser.add_argument("--n_rounds", type=int, default=3, help="Number of refinement rounds for sdp method. (3 - 5 recommended)")
     
+    parser.add_argument("--spectrum", type=str, default=None, help="If you want to find the optimal cloner for some fixed spectrum of input state.")
+    
     parser.add_argument("--verify", type=str2bool, default=False, help="Whether to run verification after optimization.")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of input sample states. (each pure, mix)")
     
@@ -37,7 +39,10 @@ if __name__ == "__main__":
     elif args.method == "sdp_perm_fix":
         solver = SolverSDPPermTwoPoint(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose)
     elif args.method == "sdp_perm":
-        solver = SolverSDPPerm(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose,p_init_grid=args.p_init_grid, p_fine_grid=args.p_fine_grid, n_rounds=args.n_rounds)
+        if args.spectrum is None:
+            solver = SolverSDPPerm(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose,p_init_grid=args.p_init_grid, p_fine_grid=args.p_fine_grid, n_rounds=args.n_rounds)
+        else:
+            solver = SolverSDPPermSpectrum(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose, spectrum=args.spectrum)
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -56,7 +61,10 @@ if __name__ == "__main__":
             filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npy"
             np.save(filepath, J)
         else:
-            filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npz"
+            if args.spectrum is not None:
+                filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}_p={args.spectrum}.npz"
+            else:
+                filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npz"
             save_choi_blocks(filepath, J)
         
         print(f"Saved J_opt to {filepath}")
