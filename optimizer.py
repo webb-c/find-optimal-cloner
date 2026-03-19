@@ -177,9 +177,8 @@ class SolverSDPPerm(Solver):
         t = cp.Variable()
         constraints = [t >= 0, t <= 1]
 
-        # scalar coefficients for each projector in each (j_out,j_in) block
-        coeff = {}   # (j2o, j2i, L2) -> scalar var >=0
-        Jexpr = {}   # (j2o, j2i) -> cvxpy affine matrix expression
+        coeff = {}   
+        Jexpr = {}   
 
         for j2o in self.j2_out_list:
             for j2i in self.j2_in_list:
@@ -189,6 +188,7 @@ class SolverSDPPerm(Solver):
                     x = cp.Variable(nonneg=True)
                     coeff[(j2o, j2i, L2)] = x
                     terms.append(x * cp.Constant(Pi))
+                # 이제 Jexpr은 mu_out * J 인 스케일된 변수 \tilde{J}를 나타냅니다.
                 Jexpr[(j2o, j2i)] = sum(terms)
 
         for j2i in self.j2_in_list:
@@ -197,7 +197,8 @@ class SolverSDPPerm(Solver):
             for j2o in self.j2_out_list:
                 d_out = j2o + 1
                 ptr = cp.partial_trace(Jexpr[(j2o, j2i)], (d_out, d_in), axis=0)
-                lhs += self.mult_out[j2o] * ptr
+                # Jexpr이 이미 mu_out을 포함하므로, 여기서는 mult_out을 곱하지 않습니다.
+                lhs += ptr 
             constraints += [lhs == np.eye(d_in, dtype=complex)]
 
         for p in self.p_samples:
@@ -214,24 +215,27 @@ class SolverSDPPerm(Solver):
                     M = cp.Constant(K) @ Jexpr[(j2o, j2i)]
                     sig_part = cp.partial_trace(M, (d_out, d_in), axis=1)
                     sig += self.mult_in[j2i] * sig_part
+                # sigma[j2o] 역시 mu_out * \sigma 인 \tilde{\sigma} 가 됩니다.
                 sigma[j2o] = (sig + sig.H) / 2
 
             fid_sum = 0
             for j2o in self.j2_out_list:
                 d_out = j2o + 1
                 X = cp.Variable((d_out, d_out), complex=True)
-                A = cp.Constant(alpha_out[j2o])
+                # LMI 블록 전체에 mu_out을 곱하여 스케일링합니다.
+                A = cp.Constant(alpha_out[j2o] * self.mult_out[j2o]) 
 
                 block = cp.bmat([[A, X],
-                                [X.H, sigma[j2o]]])
+                                    [X.H, sigma[j2o]]])
                 constraints += [block >> 0]
-                fid_sum += self.mult_out[j2o] * cp.real(cp.trace(X))
+                # X도 mu_out이 곱해진 \tilde{X}이므로 mult_out을 곱하지 않습니다.
+                fid_sum += cp.real(cp.trace(X)) 
 
             constraints += [fid_sum >= t]
 
         prob = cp.Problem(cp.Maximize(t), constraints)
         return prob, coeff, t
-
+    
     def solve_one_round(self, solver_preference=("MOSEK", "SCS")):
         prob, coeff, t = self.make_problem()
 
@@ -257,10 +261,11 @@ class SolverSDPPerm(Solver):
                     x = coeff[(j2o, j2i, L2)].value
                     if x is None:
                         raise RuntimeError("Solver failed: some coefficient is None")
-                    J += float(x) * Pi
+                    # 최적화 변수 x를 원래의 물리적 스케일로 복원하기 위해 mult_out으로 나눕니다.
+                    J += (float(x) / self.mult_out[j2o]) * Pi 
                 J_blocks[(j2o, j2i)] = (J + J.conj().T) / 2
         return float(t.value), J_blocks
-
+    
     def _apply_channel_blocks_numpy(self, J_blocks, p: float):
         rho_in = self._rho_blocks(self.n_in, float(p), self.j2_in_list)
         sigma = {}
