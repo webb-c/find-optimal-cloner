@@ -315,9 +315,10 @@ def save_local_irrep_result(path: str, result: dict, J: None):
         "worst_p": np.array(result["worst_p"], dtype=float),
         "worst_fidelity": np.array(result["worst_fidelity"], dtype=float),
         "sampled_fidelity": np.array(result.get("sampled_fidelity", 0.0), dtype=float),
-        "fidelity_curve_p": np.asarray(result["fidelity_curve_p"], dtype=float),
     }
-    
+    if "fidelity_curve_p" in result.keys():
+        save_dict["fidelity_curve_p"] = np.asarray(result["fidelity_curve_p"], dtype=float)
+
     save_dict[str((result["j2_out"], result["j2_in"]))] = J
     
 
@@ -354,3 +355,149 @@ def load_local_irrep_result(path: str):
         "fidelity_curve_p": np.asarray(data.get("fidelity_curve_p", np.array([], dtype=float)), dtype=float),
         f"({data['j2_out']}, {data['j2_in']})": data[str((data['j2_out'], data['j2_in']))]
     }
+    
+def partition_n_boxes(partition):
+    return int(sum(int(x) for x in partition))
+
+
+def lr_coeff_qubit_irreps(part_lambda, part_nu, part_mu):
+    """
+    Littlewood-Richardson coefficient c_{lambda,nu}^mu
+    for qubit Schur-Weyl irreps (partitions with at most 2 rows).
+
+    qubit case에서는 multiplicity가 0 또는 1.
+    """
+    lam = tuple(int(x) for x in part_lambda)
+    nu  = tuple(int(x) for x in part_nu)
+    mu  = tuple(int(x) for x in part_mu)
+
+    lam = normalize_partition(lam, partition_n_boxes(lam))
+    nu  = normalize_partition(nu, partition_n_boxes(nu))
+    mu  = normalize_partition(mu, partition_n_boxes(mu))
+
+    lam1, lam2 = (lam[0], 0) if len(lam) == 1 else lam
+    nu1,  nu2  = (nu[0], 0) if len(nu) == 1 else nu
+    mu1,  mu2  = (mu[0], 0) if len(mu) == 1 else mu
+
+    if (lam1 + lam2) + (nu1 + nu2) != (mu1 + mu2):
+        return 0
+
+    # GL(2) rule
+    j2_lam = lam1 - lam2
+    j2_nu  = nu1 - nu2
+
+    t = mu2 - lam2 - nu2
+    if t < 0:
+        return 0
+    if t > min(j2_lam, j2_nu):
+        return 0
+    if mu1 != lam1 + nu1 - t:
+        return 0
+
+    return 1
+
+
+def fixed_irrep_channel_local_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
+    """
+    Build the reduced/local Choi matrix for the fixed-irrep channel
+    T_{lambda -> mu}^nu in the same local spin-irrep picture used by your code.
+
+    Returns a dict containing metadata + local_choi.
+    """
+    if n_out < n_in:
+        raise ValueError("Need n_out >= n_in.")
+
+    n_anc = n_out - n_in
+
+    j2_in, part_in   = parse_qubit_irrep_label(irrep_in, n_in)
+    j2_out, part_out = parse_qubit_irrep_label(irrep_out, n_out)
+    j2_nu, part_nu   = parse_qubit_irrep_label(irrep_nu, n_anc)
+
+    c = lr_coeff_qubit_irreps(part_in, part_nu, part_out)
+    if c == 0:
+        raise ValueError(
+            f"LR coefficient is zero: "
+            f"lambda={part_in}, nu={part_nu}, mu={part_out}"
+        )
+
+    local_projectors = su2_commutant_projectors(j2_out, j2_in)
+
+    chosen = None
+    for (L2, Pi) in local_projectors:
+        if L2 != j2_nu:
+            continue
+
+        d_in = j2_in + 1
+        d_out = j2_out + 1
+
+        ptr = partial_trace_numpy(Pi, d_out, d_in, axis=0)
+        alpha = float(np.trace(ptr).real) / d_in
+        if alpha <= 0:
+            raise RuntimeError(f"Invalid normalization for L2={L2}.")
+
+        # qubit case: c is 0 or 1
+        J = Pi / (c * alpha)
+        J = (J + J.conj().T) / 2.0
+        chosen = J
+        break
+
+    if chosen is None:
+        raise ValueError(
+            f"No matching projector found for j2_nu={j2_nu} "
+            f"(j2_in={j2_in}, j2_out={j2_out})."
+        )
+
+    return {
+        "n_in": int(n_in),
+        "n_out": int(n_out),
+        "j2_in": int(j2_in),
+        "j2_out": int(j2_out),
+        "j2_nu": int(j2_nu),
+        "partition_in": tuple(part_in),
+        "partition_out": tuple(part_out),
+        "partition_nu": tuple(part_nu),
+        "lr_coeff": int(c),
+        "local_choi": np.asarray(chosen, dtype=complex),
+    }
+
+
+def fixed_irrep_channel_blocks(n_in, n_out, irrep_in, irrep_out, irrep_nu):
+    data = fixed_irrep_channel_local_choi(
+        n_in=n_in,
+        n_out=n_out,
+        irrep_in=irrep_in,
+        irrep_out=irrep_out,
+        irrep_nu=irrep_nu,
+    )
+    return {(data["j2_out"], data["j2_in"]): data["local_choi"]}
+
+
+def fixed_irrep_channel_full_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
+    """
+    Lift the local/reduced Choi matrix to the full computational-basis Choi matrix
+    using your existing SolverSDPPerm.blocks_to_full_choi().
+    """
+    data = fixed_irrep_channel_local_choi(
+        n_in=n_in,
+        n_out=n_out,
+        irrep_in=irrep_in,
+        irrep_out=irrep_out,
+        irrep_nu=irrep_nu,
+    )
+
+    helper = SolverSDPPerm(
+        n_in=n_in,
+        n_out=n_out,
+        dim=2,
+        verbose=False,
+        p_init_grid=3,
+        p_fine_grid=11,
+        n_rounds=1,
+    )
+
+    J_blocks = {(data["j2_out"], data["j2_in"]): data["local_choi"]}
+    J_full = helper.blocks_to_full_choi(J_blocks)
+
+    out = dict(data)
+    out["full_choi"] = J_full
+    return out

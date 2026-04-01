@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument("--n_in", type=int, default=1, help="Number of input clones.")
     parser.add_argument("--n_out", type=int, default=4, help="Number of output clones.")
     parser.add_argument("--dim", type=int, default=2, help="Dimension of each qubit.")
-    parser.add_argument("--method", type=str, default="sdp_perm", choices=["sdp_fix", "sdp", "sdp_perm_fix", "sdp_perm", "sdp_irrep", "sdp_irrep_global"], help="Optimization method.")
+    parser.add_argument("--method", type=str, default="sdp_perm", choices=["sdp_fix", "sdp", "sdp_perm_fix", "sdp_perm", "sdp_irrep", "sdp_irrep_global", "fixed_irrep", "fixed_irrep_all"], help="Optimization method.")
     parser.add_argument("--p_init_grid", type=int, default=21, help="Number of p grid points for sdp method. (20 - 50 recommended)")
     parser.add_argument("--p_fine_grid", type=int, default=301, help="Number of p grid points for refinement. (300 - 500 recommended)")
     parser.add_argument("--n_rounds", type=int, default=3, help="Number of refinement rounds for sdp method. (3 - 5 recommended)")
@@ -54,6 +54,29 @@ if __name__ == "__main__":
         solver = SolverLocalIrrepSDP(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose, p_init_grid=args.p_init_grid, p_fine_grid=args.p_fine_grid, n_rounds=args.n_rounds, irrep_in=args.irrep_in, irrep_out=args.irrep_out)
     elif args.method == "sdp_irrep_global":
         solver = SolverGlobalIrrepSDP(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose, p_init_grid=args.p_init_grid, p_fine_grid=args.p_fine_grid, n_rounds=args.n_rounds, local_cache_dir=args.irrep_local_dir, reuse_local_irrep=args.reuse_irrep_local)
+    elif args.method == "fixed_irrep":
+        if args.irrep_in is None or args.irrep_out is None:
+            raise ValueError("fixed_irrep requires both --irrep_in and --irrep_out.")
+        solver = SolverFixedIrrepFamily(n_in=args.n_in, n_out=args.n_out, dim=args.dim, verbose=args.verbose, p_init_grid=args.p_init_grid, p_fine_grid=args.p_fine_grid, n_rounds=args.n_rounds, irrep_in=args.irrep_in, irrep_out=args.irrep_out)
+    elif args.method == "fixed_irrep_all":
+        summary = save_all_fixed_irrep_families(
+            n_in=args.n_in,
+            n_out=args.n_out,
+            dim=args.dim,
+            verbose=args.verbose,
+            p_init_grid=args.p_init_grid,
+            p_fine_grid=args.p_fine_grid,
+            n_rounds=args.n_rounds,
+            cache_dir="data/fixed_irrep",
+        )
+        print("\n[saved files]")
+        for path in summary["saved_files"]:
+            print(path)
+        print("\n[skipped pairs]")
+        for part_in, part_out, reason in summary["skipped_pairs"]:
+            print(f"{part_in} -> {part_out}: {reason}")
+            
+        exit(0)
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -62,6 +85,8 @@ if __name__ == "__main__":
     elif args.method == "sdp_irrep":
         J = solver.get_solution()
         print(solver.describe_result())
+    elif args.method == "fixed_irrep":
+        J = solver.get_solution_blocks()
     else:
         J = solver.get_solution_blocks()
         
@@ -89,6 +114,10 @@ if __name__ == "__main__":
         elif args.method == "sdp_irrep_global":
             filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npz"
             solver.save_result(filepath)
+        elif args.method == "fixed_irrep":
+            filepath = f"data/fixed_irrep/{args.n_in}_to_{args.n_out}_omitted.npz"
+            saved = solver.save_all_results()
+            print(saved)
         else:
             if args.spectrum is not None:
                 filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}_p={args.spectrum}.npz"

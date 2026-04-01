@@ -977,3 +977,285 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
             save_dict[str(k)] = J
             save_dict[f"c_{k}"] = np.array(self._coefficients[k], dtype=float)
         np.savez_compressed(path, **save_dict)
+
+
+class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
+    """
+    For a fixed irrep pair lambda -> mu, build every admissible fixed-nu channel
+    T^{nu}_{lambda -> mu}, evaluate its fidelity curve, and optionally save each
+    result in the same .npz format used by save_local_irrep_result().
+
+    Saved result format is intentionally compatible with load_local_irrep_result().
+    """
+    def __init__(self, n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=101, n_rounds=1, irrep_in=None, irrep_out=None, cache_dir="data/fixed_irrep"):
+        super().__init__(n_in=n_in, n_out=n_out, dim=dim, verbose=verbose, p_init_grid=p_init_grid, p_fine_grid=p_fine_grid, n_rounds=n_rounds, irrep_in=irrep_in, irrep_out=irrep_out)
+
+        self.cache_dir = cache_dir
+        self.n_anc = self.n_out - self.n_in
+
+        self.j2_nu_list = []
+        self.partition_nu_list = []
+
+        for j2_nu in j2_list_for_n_qubits(self.n_anc):
+            part_nu = j2_to_qubit_partition(self.n_anc, j2_nu)
+            c = lr_coeff_qubit_irreps(self.partition_in, part_nu, self.partition_out)
+            if c != 0:
+                self.j2_nu_list.append(int(j2_nu))
+                self.partition_nu_list.append(tuple(part_nu))
+
+        self._results_by_j2_nu = None
+        self._blocks_by_j2_nu = None
+
+    def _normalize_nu_label(self, irrep_nu):
+        """
+        Accept either j2_nu (int) or partition label, return canonical j2_nu.
+        """
+        if isinstance(irrep_nu, (int, np.integer)):
+            j2_nu = int(irrep_nu)
+        else:
+            j2_nu, _ = parse_qubit_irrep_label(irrep_nu, self.n_anc)
+
+        if j2_nu not in self.j2_nu_list:
+            raise ValueError(
+                f"nu={irrep_nu} is not admissible for "
+                f"{self.partition_in} -> {self.partition_out}. "
+                f"Allowed j2_nu values: {self.j2_nu_list}"
+            )
+        return j2_nu
+
+    def admissible_nu_labels(self):
+        return [
+            {
+                "j2_nu": int(j2_nu),
+                "partition_nu": tuple(j2_to_qubit_partition(self.n_anc, j2_nu)),
+            }
+            for j2_nu in self.j2_nu_list
+        ]
+
+    def _cache_path_for_nu(self, j2_nu: int):
+        part_in = str(tuple(self.partition_in)).replace(" ", "")
+        part_out = str(tuple(self.partition_out)).replace(" ", "")
+        part_nu = str(tuple(j2_to_qubit_partition(self.n_anc, j2_nu))).replace(" ", "")
+        filename = f"{self.n_in}_to_{self.n_out}_{part_in}_to_{part_out}_nu_{part_nu}.npz"
+        return os.path.join(self.cache_dir, filename)
+    
+    def _result_dict_for_fixed_nu(self, j2_nu: int):
+        part_nu = j2_to_qubit_partition(self.n_anc, j2_nu)
+        fixed_data = fixed_irrep_channel_local_choi(
+            n_in=self.n_in,
+            n_out=self.n_out,
+            irrep_in=self.partition_in,
+            irrep_out=self.partition_out,
+            irrep_nu=part_nu,
+        )
+        J = np.asarray(fixed_data["local_choi"], dtype=complex)
+
+        # sampled lower bound on the coarse grid
+        self.p_samples = sorted(set(np.linspace(0.5, 1.0, self.p_init_grid).tolist()))
+        sampled_roots = []
+        for p in self.p_samples:
+            rho_in = self._local_input_state(float(p))
+            rho_out = self._local_output_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            sigma = apply_local_choi_numpy(J, rho_in)
+            sampled_roots.append(fidelity_root_numpy(rho_out, sigma))
+
+        if len(sampled_roots) == 0:
+            sampled_root_lb = 0.0
+        else:
+            sampled_root_lb = float(np.min(np.asarray(sampled_roots, dtype=float)))
+
+        # full fidelity curve
+        p_curve, root_curve = self.fidelity_curve(J, p_grid=np.linspace(0.5, 1.0, self.p_fine_grid))
+        idx = int(np.argmin(root_curve))
+        worst_p = float(p_curve[idx])
+        worst_root = float(root_curve[idx])
+
+        weights = {int(L2): 1.0 if int(L2) == int(j2_nu) else 0.0 for L2 in self.local_basis.keys()}
+        
+        result = {
+            "n_in": int(self.n_in),
+            "n_out": int(self.n_out),
+            "j2_in": int(self.j2_in),
+            "j2_out": int(self.j2_out),
+            "j2_nu": int(j2_nu),
+            "partition_nu": tuple(j2_to_qubit_partition(self.n_anc, j2_nu)),
+            "worst_p": float(worst_p),
+            "worst_fidelity": float(worst_root ** 2),
+            "weights": weights,
+            "local_choi_basis": {int(L2): np.asarray(B, dtype=complex) for L2, B in self.local_basis.items()},
+        }
+        result[str((self.j2_out, self.j2_in))] = J
+        return result
+
+    def solve(self):
+        """
+        Build all admissible fixed-nu channels.
+        Returns
+        -------
+        dict : j2_nu -> local_choi
+        """
+        if self._blocks_by_j2_nu is not None:
+            return self._blocks_by_j2_nu
+
+        results = {}
+        blocks = {}
+
+        for j2_nu in self.j2_nu_list:
+            result = self._result_dict_for_fixed_nu(j2_nu)
+            results[int(j2_nu)] = result
+            blocks[int(j2_nu)] = {
+                (self.j2_out, self.j2_in): np.asarray(result[str((self.j2_out, self.j2_in))], dtype=complex)
+            }
+
+            if self.verbose:
+                print(
+                    f"[fixed nu] {self.partition_in} -> {self.partition_out}, "
+                    f"nu={result['partition_nu']}"
+                    f"worst F≈{result['worst_fidelity']:.8f}"
+                )
+
+        self._results_by_j2_nu = results
+        self._blocks_by_j2_nu = blocks
+        return self._blocks_by_j2_nu
+
+    def get_solution(self):
+        return self.solve()
+
+    def get_solution_blocks(self):
+        return self.solve()
+
+    def get_result(self, irrep_nu):
+        self.solve()
+        j2_nu = self._normalize_nu_label(irrep_nu)
+        return self._results_by_j2_nu[j2_nu]
+
+    def get_all_results(self):
+        self.solve()
+        return self._results_by_j2_nu
+
+    def get_result_by_partition_nu(self):
+        self.solve()
+        return {
+            tuple(j2_to_qubit_partition(self.n_anc, j2_nu)): result
+            for j2_nu, result in self._results_by_j2_nu.items()
+        }
+
+    def save_result(self, irrep_nu, path=None):
+        self.solve()
+        j2_nu = self._normalize_nu_label(irrep_nu)
+        result = self._results_by_j2_nu[j2_nu]
+        if path is None:
+            path = self._cache_path_for_nu(j2_nu)
+        save_local_irrep_result(path, result)
+        return path
+
+    def save_all_results(self):
+        self.solve()
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        saved = {}
+        for j2_nu in self.j2_nu_list:
+            path = self._cache_path_for_nu(j2_nu)
+            save_local_irrep_result(path, self._results_by_j2_nu[j2_nu], self._results_by_j2_nu[j2_nu][str((self.j2_out, self.j2_in))])
+            saved[j2_nu] = path
+        return saved
+
+    def describe_results(self):
+        self.solve()
+        lines = []
+        lines.append(
+            f"Fixed-nu family for input {self.partition_in} (j2={self.j2_in}) "
+            f"-> output {self.partition_out} (j2={self.j2_out})"
+        )
+        for j2_nu in self.j2_nu_list:
+            result = self._results_by_j2_nu[j2_nu]
+            lines.append(
+                f"  nu={result['partition_nu']} (j2={j2_nu}): "
+                f"worst_F≈{result['worst_fidelity']:.10f}, "
+                f"worst_p≈{result['worst_p']:.10f}"
+            )
+        return "\n".join(lines)
+
+
+def save_all_fixed_irrep_families(
+    n_in,
+    n_out,
+    dim=2,
+    verbose=False,
+    p_init_grid=5,
+    p_fine_grid=101,
+    n_rounds=1,
+    cache_dir="data/fixed_irrep",
+    skip_empty=True,
+):
+    """
+    For all input/output qubit irreps for (n_in, n_out), build SolverFixedIrrepFamily
+    and save every admissible fixed-nu map.
+
+    Returns
+    -------
+    summary : dict
+        {
+            "saved_files": [paths...],
+            "saved_pairs": [((part_in), (part_out))...],
+            "skipped_pairs": [((part_in), (part_out), reason)...],
+        }
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+
+    input_parts = [tuple(j2_to_qubit_partition(n_in, j2)) for j2 in j2_list_for_n_qubits(n_in)]
+    output_parts = [tuple(j2_to_qubit_partition(n_out, j2)) for j2 in j2_list_for_n_qubits(n_out)]
+
+    saved_files = []
+    saved_pairs = []
+    skipped_pairs = []
+
+    for part_in in input_parts:
+        for part_out in output_parts:
+            try:
+                solver = SolverFixedIrrepFamily(
+                    n_in=n_in,
+                    n_out=n_out,
+                    dim=dim,
+                    verbose=verbose,
+                    p_init_grid=p_init_grid,
+                    p_fine_grid=p_fine_grid,
+                    n_rounds=n_rounds,
+                    irrep_in=part_in,
+                    irrep_out=part_out,
+                    cache_dir=cache_dir,
+                )
+
+                admissible = solver.admissible_nu_labels()
+                if len(admissible) == 0:
+                    msg = "no admissible nu"
+                    skipped_pairs.append((part_in, part_out, msg))
+                    if verbose:
+                        print(f"[skip] {part_in} -> {part_out}: {msg}")
+                    if skip_empty:
+                        continue
+
+                saved = solver.save_all_results()
+                saved_paths = list(saved.values())
+
+                saved_files.extend(saved_paths)
+                saved_pairs.append((part_in, part_out))
+
+                if verbose:
+                    print(
+                        f"[saved] {part_in} -> {part_out}: "
+                        f"{len(saved_paths)} file(s), nus={admissible}"
+                    )
+
+            except Exception as e:
+                skipped_pairs.append((part_in, part_out, str(e)))
+                print(f"[error] {part_in} -> {part_out}: {e}")
+
+    return {
+        "saved_files": saved_files,
+        "saved_pairs": saved_pairs,
+        "skipped_pairs": skipped_pairs,
+    }
