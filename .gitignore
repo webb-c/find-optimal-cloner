@@ -3,3 +3,5 @@ cmd.sh
 .DS_Store
 __pycache__/
 figure/
+sim.py
+testor/

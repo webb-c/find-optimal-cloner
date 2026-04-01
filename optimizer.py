@@ -1,5 +1,6 @@
 import numpy as np
 import cvxpy as cp
+import os
 import math
 from abc import ABC, abstractmethod
 from utils import *
@@ -505,3 +506,474 @@ class SolverSDPPermSpectrum(SolverSDPPerm):
         best = (t_opt, J_opt, self.p_samples, self.p_samples[0], fvals)
 
         return best[1]
+
+
+class SolverLocalIrrepSDP(SolverSDPPerm):
+    def __init__(self, n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=51, n_rounds=3, irrep_in=None, irrep_out=None):
+        super().__init__(n_in=n_in, n_out=n_out, dim=dim, verbose=verbose, p_init_grid=p_init_grid, p_fine_grid=p_fine_grid, n_rounds=n_rounds)
+        if dim != 2:
+            raise ValueError("SolverLocalIrrepSDP currently supports only qubits (dim=2).")
+        if irrep_in is None or irrep_out is None:
+            raise ValueError("SolverLocalIrrepSDP requires both irrep_in and irrep_out.")
+
+        self.j2_in, self.partition_in = parse_qubit_irrep_label(irrep_in, n_in)
+        self.j2_out, self.partition_out = parse_qubit_irrep_label(irrep_out, n_out)
+        self.local_d_in = self.j2_in + 1
+        self.local_d_out = self.j2_out + 1
+        self.local_projectors = list(self.P[(self.j2_out, self.j2_in)])
+        self.local_basis = self._build_local_basis_channels()
+
+        self._local_choi = None
+        self._weights = None
+        self._worst_p = None
+        self._worst_root_fidelity = None
+        self._fidelity_curve_p = None
+        self._fidelity_curve_root = None
+        self._sampled_root_lb = None
+
+    def _build_local_basis_channels(self):
+        basis = {}
+        I_in = np.eye(self.local_d_in, dtype=complex)
+        for (L2, Pi) in self.local_projectors:
+            ptr = partial_trace_numpy(Pi, self.local_d_out, self.local_d_in, axis=0)
+            alpha = float(np.trace(ptr).real) / self.local_d_in
+            if alpha <= 0:
+                raise RuntimeError(f"Invalid partial-trace coefficient for L2={L2}: alpha={alpha}")
+            residual = np.linalg.norm(ptr - alpha * I_in)
+            if residual > 1e-7:
+                raise RuntimeError(
+                    f"Projector for L2={L2} does not give scalar partial trace; residual={residual:.3e}"
+                )
+            basis[L2] = (Pi / alpha + (Pi / alpha).conj().T) / 2.0
+        return basis
+
+    def _local_input_state(self, p: float):
+        try:
+            rho_in = normalized_spin_irrep_state(self.n_in, self.j2_in, float(p))
+            return rho_in
+        except ValueError:
+            return None
+
+    def _local_output_state(self, p: float):
+        try:
+            rho_out = normalized_spin_irrep_state(self.n_out, self.j2_out, float(p))
+            return rho_out
+        except ValueError:
+            return None
+        # return normalized_spin_irrep_state(self.n_out, self.j2_out, float(p))
+
+    def make_problem(self):
+        q = {L2: cp.Variable(nonneg=True) for (L2, _) in self.local_projectors}
+        t = cp.Variable()
+        constraints = [t >= 0, t <= 1, cp.sum(list(q.values())) == 1]
+
+        Jexpr = 0
+        for (L2, _) in self.local_projectors:
+            Jexpr += q[L2] * cp.Constant(self.local_basis[L2])
+
+        constraints += [cp.partial_trace(Jexpr, (self.local_d_out, self.local_d_in), axis=0) == np.eye(self.local_d_in, dtype=complex)]
+
+        for p in self.p_samples:
+            rho_in = self._local_input_state(float(p))
+            rho_out = self._local_output_state(float(p))
+            if rho_out is None:
+                continue
+            M = cp.Constant(np.kron(np.eye(self.local_d_out, dtype=complex), rho_in.T)) @ Jexpr
+            sigma = cp.partial_trace(M, (self.local_d_out, self.local_d_in), axis=1)
+            sigma = (sigma + sigma.H) / 2
+
+            X = cp.Variable((self.local_d_out, self.local_d_out), complex=True)
+            block = cp.bmat([[cp.Constant(rho_out), X], [X.H, sigma]])
+            constraints += [block >> 0]
+            constraints += [cp.real(cp.trace(X)) >= t]
+
+        prob = cp.Problem(cp.Maximize(t), constraints)
+        return prob, q, t
+
+    def solve_one_round(self, solver_preference=("MOSEK", "SCS")):
+        prob, q, t = self.make_problem()
+
+        chosen = None
+        for s in solver_preference:
+            if s in cp.installed_solvers():
+                chosen = s
+                break
+        if chosen is None:
+            raise RuntimeError("No suitable SDP solver found. Install one of MOSEK or SCS.")
+
+        prob.solve(solver=chosen, verbose=self.verbose)
+        if t.value is None:
+            raise RuntimeError("Solver failed: t.value is None")
+
+        weights = {}
+        J = np.zeros((self.local_d_out * self.local_d_in, self.local_d_out * self.local_d_in), dtype=complex)
+        for (L2, _) in self.local_projectors:
+            val = q[L2].value
+            if val is None:
+                raise RuntimeError(f"Solver failed: q[{L2}] is None")
+            weights[L2] = float(val)
+            J += float(val) * self.local_basis[L2]
+        J = (J + J.conj().T) / 2.0
+        return float(t.value), weights, J
+
+    def fidelity_curve(self, J: np.ndarray, p_grid=None):
+        if p_grid is None:
+            p_grid = np.linspace(0.5, 1.0, self.p_fine_grid)
+        roots = []
+        for p in p_grid:
+            rho_in = self._local_input_state(float(p))
+            rho_out = self._local_output_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            sigma = apply_local_choi_numpy(J, rho_in)
+            roots.append(fidelity_root_numpy(rho_out, sigma))
+        return np.asarray(p_grid, dtype=float), np.asarray(roots, dtype=float)
+
+    def solve(self):
+        if self._local_choi is not None:
+            return self._local_choi
+
+        self.p_samples = sorted(set(np.linspace(0.5, 1.0, self.p_init_grid).tolist()))
+
+        best_t = None
+        best_weights = None
+        best_J = None
+        best_worst_p = None
+        best_worst_root = None
+        best_curve_p = None
+        best_curve_root = None
+
+        for it in range(self.n_rounds):
+            t_opt, weights, J_opt = self.solve_one_round()
+            p_curve, root_curve = self.fidelity_curve(J_opt)
+            idx = int(np.argmin(root_curve))
+            p_worst = float(p_curve[idx])
+            root_worst = float(root_curve[idx])
+
+            if self.verbose:
+                print(
+                    f"[Round {it}] local-irrep root-fidelity LB on samples = {t_opt:.8f} (F≈{t_opt**2:.8f})"
+                )
+                print(
+                    f"           worst on fine grid: p={p_worst:.6f}, rootF={root_worst:.8f} (F≈{root_worst**2:.8f})"
+                )
+                print(
+                    "           mixture weights: "
+                    + ", ".join([f"L2={L2}:{weights[L2]:.6f}" for L2 in sorted(weights)])
+                )
+
+            best_t = t_opt
+            best_weights = weights
+            best_J = J_opt
+            best_worst_p = p_worst
+            best_worst_root = root_worst
+            best_curve_p = p_curve
+            best_curve_root = root_curve
+
+            if min(abs(p_worst - np.asarray(self.p_samples))) < 1e-6:
+                break
+            self.p_samples.append(p_worst)
+            self.p_samples = sorted(set(self.p_samples))
+
+        self._sampled_root_lb = float(best_t)
+        self._weights = dict(best_weights)
+        self._local_choi = np.asarray(best_J, dtype=complex)
+        self._worst_p = float(best_worst_p)
+        self._worst_root_fidelity = float(best_worst_root)
+        self._fidelity_curve_p = np.asarray(best_curve_p, dtype=float)
+        self._fidelity_curve_root = np.asarray(best_curve_root, dtype=float)
+        return self._local_choi
+
+    def get_solution(self):
+        return self.solve()
+
+    def get_solution_blocks(self):
+        self.solve()
+        return np.asarray(self._local_choi, dtype=complex)
+
+    def get_result(self):
+        self.solve()
+        return local_irrep_result_to_dict(self)
+
+    def describe_result(self):
+        result = self.get_result()
+        lines = []
+        lines.append(
+            f"Local irrep solver result: input {result['partition_in']} (j2={result['j2_in']}) -> output {result['partition_out']} (j2={result['j2_out']})"
+        )
+        lines.append(f"Worst-case root fidelity ≈ {result['worst_root_fidelity']:.10f}")
+        lines.append(f"Worst-case fidelity      ≈ {result['worst_fidelity']:.10f}")
+        lines.append(f"Worst spectrum p         ≈ {result['worst_p']:.10f}")
+        lines.append("Optimal covariant local map:")
+        lines.append("  T = sum_L q_L T_L")
+        for L2 in sorted(result['weights']):
+            lines.append(f"    q_(L2={L2}) = {result['weights'][L2]:.10f}")
+        return "\n".join(lines)
+
+    def save_result(self, path: str):
+        save_local_irrep_result(path, self.get_result(), self.get_solution_blocks())
+
+
+class SolverGlobalIrrepSDP(SolverSDPPerm):
+    def __init__(self, n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=51, n_rounds=3, local_cache_dir="data/sdp_irrep", reuse_local_irrep=True):
+        super().__init__(n_in=n_in, n_out=n_out, dim=dim, verbose=verbose, p_init_grid=p_init_grid, p_fine_grid=p_fine_grid, n_rounds=n_rounds)
+        self.local_cache_dir = local_cache_dir
+        self.reuse_local_irrep = reuse_local_irrep
+
+        self.local_results = {}
+        self._coefficients = None
+        self._solution_blocks = None
+        self._worst_p = None
+        self._worst_root_fidelity = None
+        self._sampled_root_lb = None
+
+    def _cache_path_for_pair(self, j2_out: int, j2_in: int):
+        part_in = str(j2_to_qubit_partition(self.n_in, j2_in)).replace(" ", "")
+        part_out = str(j2_to_qubit_partition(self.n_out, j2_out)).replace(" ", "")
+        filepath = f"{self.n_in}_to_{self.n_out}_{part_in}_to_{part_out}.npz"
+
+        return os.path.join(self.local_cache_dir, filepath)
+
+    def _local_cache_is_usable(self, result: dict, j2_out: int, j2_in: int):
+        if result["n_in"] != self.n_in or result["n_out"] != self.n_out:
+            return False
+        if result["j2_in"] != j2_in or result["j2_out"] != j2_out:
+            return False
+        curve_p = np.asarray(result.get("fidelity_curve_p", np.array([], dtype=float)), dtype=float)
+        return curve_p.size > 0 and abs(float(np.max(curve_p)) - 1.0) <= 1e-10
+
+    def _compute_local_result(self, j2_out: int, j2_in: int):
+        solver = SolverLocalIrrepSDP(
+            n_in=self.n_in,
+            n_out=self.n_out,
+            dim=self.dim,
+            verbose=self.verbose,
+            p_init_grid=self.p_init_grid,
+            p_fine_grid=self.p_fine_grid,
+            n_rounds=self.n_rounds,
+            irrep_in=j2_to_qubit_partition(self.n_in, j2_in),
+            irrep_out=j2_to_qubit_partition(self.n_out, j2_out),
+        )
+        solver.solve()
+        result = solver.get_result()
+        if self.local_cache_dir is not None:
+            save_local_irrep_result(self._cache_path_for_pair(j2_out, j2_in), result, solver.get_solution_blocks())
+        
+        result[str((j2_out, j2_in))] = solver.get_solution_blocks()
+        return result
+
+    def _get_local_result(self, j2_out: int, j2_in: int):
+        key = (j2_out, j2_in)
+        if key in self.local_results:
+            return self.local_results[key]
+
+        result = None
+        if self.local_cache_dir is not None and self.reuse_local_irrep:
+            path = self._cache_path_for_pair(j2_out, j2_in)
+            if os.path.exists(path):
+                try:
+                    loaded = load_local_irrep_result(path)
+                    if self._local_cache_is_usable(loaded, j2_out, j2_in):
+                        result = loaded
+                    elif self.verbose:
+                        print(f"[sdp_irrep_global] Recomputing stale local cache: {path}")
+                except Exception:
+                    if self.verbose:
+                        print(f"[sdp_irrep_global] Failed to load cache, recomputing: {path}")
+
+        if result is None:
+            result = self._compute_local_result(j2_out, j2_in)
+
+        self.local_results[key] = result
+        return result
+
+    def _ensure_all_local_results(self):
+        for j2_out in self.j2_out_list:
+            for j2_in in self.j2_in_list:
+                self._get_local_result(j2_out, j2_in)
+
+    def save_local_results(self):
+        self._ensure_all_local_results()
+        if self.local_cache_dir is None:
+            return
+        os.makedirs(self.local_cache_dir, exist_ok=True)
+        
+        for (j2_out, j2_in), result in self.local_results.items():
+            sol = result[str((j2_out, j2_in))]
+            save_local_irrep_result(self._cache_path_for_pair(j2_out, j2_in), result, sol)
+
+    def make_problem(self):
+        self._ensure_all_local_results()
+
+        t = cp.Variable()
+        constraints = [t >= 0, t <= 1]
+        coeff = {}
+        Jexpr = {}
+
+        for j2_out in self.j2_out_list:
+            for j2_in in self.j2_in_list:
+                y = cp.Variable(nonneg=True)
+                coeff[(j2_out, j2_in)] = y
+                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][str((j2_out, j2_in))], dtype=complex)
+                Jexpr[(j2_out, j2_in)] = y * cp.Constant(J_loc)
+
+        for j2_in in self.j2_in_list:
+            constraints += [cp.sum([coeff[(j2_out, j2_in)] for j2_out in self.j2_out_list]) == 1]
+
+        for p in self.p_samples:
+            rho_in = self._rho_blocks(self.n_in, float(p), self.j2_in_list)
+            alpha_out = self._rho_blocks(self.n_out, float(p), self.j2_out_list)
+
+            sigma = {}
+            for j2_out in self.j2_out_list:
+                d_out = j2_out + 1
+                sig = 0
+                for j2_in in self.j2_in_list:
+                    d_in = j2_in + 1
+                    K = np.kron(np.eye(d_out, dtype=complex), rho_in[j2_in].T)
+                    M = cp.Constant(K) @ Jexpr[(j2_out, j2_in)]
+                    sig_part = cp.partial_trace(M, (d_out, d_in), axis=1)
+                    sig += self.mult_in[j2_in] * sig_part
+                sigma[j2_out] = (sig + sig.H) / 2
+
+            fid_sum = 0
+            for j2_out in self.j2_out_list:
+                d_out = j2_out + 1
+                X = cp.Variable((d_out, d_out), complex=True)
+                A = cp.Constant(alpha_out[j2_out] * self.mult_out[j2_out])
+                block = cp.bmat([[A, X], [X.H, sigma[j2_out]]])
+                constraints += [block >> 0]
+                fid_sum += cp.real(cp.trace(X))
+
+            constraints += [fid_sum >= t]
+
+        prob = cp.Problem(cp.Maximize(t), constraints)
+        return prob, coeff, t
+
+    def solve_one_round(self, solver_preference=("MOSEK", "SCS")):
+        prob, coeff, t = self.make_problem()
+
+        chosen = None
+        for s in solver_preference:
+            if s in cp.installed_solvers():
+                chosen = s
+                break
+        if chosen is None:
+            raise RuntimeError("No suitable solver found. Install one of MOSEK or SCS (etc.).")
+
+        prob.solve(solver=chosen, verbose=self.verbose)
+        if t.value is None:
+            raise RuntimeError("Solver failed: t.value is None")
+
+        coeff_vals = {}
+        J_blocks = {}
+        for j2_out in self.j2_out_list:
+            for j2_in in self.j2_in_list:
+                y = coeff[(j2_out, j2_in)].value
+                if y is None:
+                    raise RuntimeError("Solver failed: some coefficient is None")
+                coeff_vals[(j2_out, j2_in)] = float(y)
+                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][str((j2_out, j2_in))], dtype=complex)
+                J_phys = (float(y) / self.mult_out[j2_out]) * J_loc
+                J_blocks[(j2_out, j2_in)] = (J_phys + J_phys.conj().T) / 2.0
+        return float(t.value), coeff_vals, J_blocks
+
+    def solve(self):
+        if self._solution_blocks is not None:
+            return self._solution_blocks
+
+        self._ensure_all_local_results()
+        self.p_samples = sorted(set(np.linspace(0.5, 1.0, self.p_init_grid).tolist()))
+
+        best = None
+        for it in range(self.n_rounds):
+            t_opt, coeff_opt, J_opt = self.solve_one_round()
+
+            p_fine = np.linspace(0.5, 1.0, self.p_fine_grid)
+            fvals = []
+            for p in p_fine:
+                sigma_blocks = self._apply_channel_blocks_numpy(J_opt, float(p))
+                fvals.append(self._root_fidelity_full_numpy(float(p), sigma_blocks))
+            fvals = np.asarray(fvals, dtype=float)
+
+            idx = int(np.argmin(fvals))
+            p_worst = float(p_fine[idx])
+            f_worst = float(fvals[idx])
+
+            if self.verbose:
+                print(f"[Round {it}] global-irrep root-fidelity LB on samples = {t_opt:.8f} (F≈{t_opt**2:.8f})")
+                print(f"         worst on fine grid: p={p_worst:.6f}, rootF={f_worst:.8f} (F≈{f_worst**2:.8f})")
+                for j2_in in self.j2_in_list:
+                    part_in = j2_to_qubit_partition(self.n_in, j2_in)
+                    coeff_msg = []
+                    for j2_out in self.j2_out_list:
+                        part_out = j2_to_qubit_partition(self.n_out, j2_out)
+                        coeff_msg.append(f"{part_out}:{coeff_opt[(j2_out, j2_in)]:.6f}")
+                    print(f"         coeffs for input {part_in}: " + ", ".join(coeff_msg))
+
+            best = (t_opt, coeff_opt, J_opt, p_worst, f_worst)
+            if min(abs(p_worst - np.asarray(self.p_samples))) < 1e-6:
+                break
+            self.p_samples.append(p_worst)
+            self.p_samples = sorted(set(self.p_samples))
+
+        self._sampled_root_lb = float(best[0])
+        self._coefficients = dict(best[1])
+        self._solution_blocks = best[2]
+        self._worst_p = float(best[3])
+        self._worst_root_fidelity = float(best[4])
+        return self._solution_blocks
+
+    def get_solution_blocks(self):
+        return self.solve()
+
+    def get_solution(self):
+        if self._solution_blocks is None:
+            self.solve()
+            J_full = self.blocks_to_full_choi(self._solution_blocks)
+        return J_full
+
+    def get_coefficients(self):
+        if self._coefficients is None:
+            self.solve()
+        return dict(self._coefficients)
+
+    def get_coefficients_by_partition(self):
+        coeff = self.get_coefficients()
+        out = {}
+        for (j2_out, j2_in), val in coeff.items():
+            out[(j2_to_qubit_partition(self.n_out, j2_out), j2_to_qubit_partition(self.n_in, j2_in))] = float(val)
+        return out
+
+    def describe_result(self):
+        self.get_solution_blocks()
+        lines = []
+        lines.append(f"Global irrep-assembled solver result: N={self.n_in} -> M={self.n_out}")
+        lines.append(f"Worst-case root fidelity ≈ {self._worst_root_fidelity:.10f}")
+        lines.append(f"Worst-case fidelity      ≈ {self._worst_root_fidelity**2:.10f}")
+        lines.append(f"Worst spectrum p         ≈ {self._worst_p:.10f}")
+        if self._sampled_root_lb is not None:
+            lines.append(f"Sampled-grid root-F LB   ≈ {self._sampled_root_lb:.10f}")
+        lines.append("Assembly coefficients (sum over output irreps = 1 for each input irrep):")
+        for j2_in in self.j2_in_list:
+            part_in = j2_to_qubit_partition(self.n_in, j2_in)
+            lines.append(f"  input {part_in}:")
+            for j2_out in self.j2_out_list:
+                part_out = j2_to_qubit_partition(self.n_out, j2_out)
+                lines.append(f"    coeff[{part_out}] = {self.get_coefficients()[(j2_out, j2_in)]:.10f}")
+        return "\n".join(lines)
+
+    def save_result(self, path: str):
+        self.get_solution_blocks()
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        save_dict = {
+            "worst_p": np.array(self._worst_p, dtype=float),
+            "worst_fidelity": np.array(self._worst_root_fidelity ** 2, dtype=float),
+            "sampled_fidelity": np.array(self._sampled_root_lb ** 2, dtype=float),
+        }   
+        for k, J in self._solution_blocks.items():
+            save_dict[str(k)] = J
+            save_dict[f"c_{k}"] = np.array(self._coefficients[k], dtype=float)
+        np.savez_compressed(path, **save_dict)
