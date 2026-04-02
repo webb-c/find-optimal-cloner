@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument("--n_in", type=int, default=1, help="Number of input clones.")
     parser.add_argument("--n_out", type=int, default=4, help="Number of output clones.")
     parser.add_argument("--dim", type=int, default=2, help="Dimension of each qubit.")
-    parser.add_argument("--method", type=str, default="sdp_perm", choices=["sdp_fix", "sdp", "sdp_perm_fix", "sdp_perm", "sdp_irrep", "sdp_irrep_global", "fixed_irrep", "fixed_irrep_all"], help="Optimization method.")
+    parser.add_argument("--method", type=str, default="sdp_perm", choices=["sdp_fix", "sdp", "sdp_perm_fix", "sdp_perm", "sdp_irrep", "sdp_irrep_global", "fixed_irrep", "fixed_irrep_all", "exact_irrep"], help="Optimization method.")
     parser.add_argument("--p_init_grid", type=int, default=21, help="Number of p grid points for sdp method. (20 - 50 recommended)")
     parser.add_argument("--p_fine_grid", type=int, default=301, help="Number of p grid points for refinement. (300 - 500 recommended)")
     parser.add_argument("--n_rounds", type=int, default=3, help="Number of refinement rounds for sdp method. (3 - 5 recommended)")
@@ -21,6 +21,7 @@ def parse_args():
     
     parser.add_argument("--irrep_local_dir", type=str, default="data/sdp_irrep", help="Directory used to save/reuse local irrep solutions.")
     parser.add_argument("--reuse_irrep_local", type=str2bool, default=True, help="Whether sdp_irrep_global reuses saved local-irrep solutions.")
+    parser.add_argument("--include_abstract_spin_only", type=str2bool, default=False, help="For exact_irrep only: also include non-physical abstract spin-only auxiliary sectors when dim Sp_in = dim Sp_out = 1.")
     
     parser.add_argument("--verify", type=str2bool, default=False, help="Whether to run verification after optimization.")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of input sample states. (each pure, mix)")
@@ -77,6 +78,26 @@ if __name__ == "__main__":
             print(f"{part_in} -> {part_out}: {reason}")
             
         exit(0)
+    elif args.method == "exact_irrep":
+        summary = save_all_exact_irrep_families(
+            n_in=args.n_in,
+            n_out=args.n_out,
+            dim=args.dim,
+            verbose=args.verbose,
+            p_init_grid=args.p_init_grid,
+            p_fine_grid=args.p_fine_grid,
+            n_rounds=args.n_rounds,
+            cache_dir="data/exact_irrep",
+            include_abstract_spin_only=args.include_abstract_spin_only,
+        )
+        print("\n[saved files]")
+        for path in summary["saved_files"]:
+            print(path)
+        print("\n[skipped pairs]")
+        for part_in, part_out, reason in summary["skipped_pairs"]:
+            print(f"{part_in} -> {part_out}: {reason}")
+
+        exit(0)
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -91,6 +112,8 @@ if __name__ == "__main__":
         J = solver.get_solution_blocks()
         
     if args.verify:
+        if Verifier is None:
+            raise ModuleNotFoundError("verifier.py is required when --verify is used.")
         if args.method in ["sdp", "sdp_fix"]:
             J_choi = solver.get_solution()
         else:

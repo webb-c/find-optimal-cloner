@@ -174,6 +174,67 @@ class SolverSDPPerm(Solver):
     def _rho_blocks(self, n: int, p: float, j2_list):
         return {j2: rho_block_diag_in_spin_irrep(n, j2, p) for j2 in j2_list}
 
+    def _rho_blocks_grid(self, n: int, j2_list, p_grid):
+        p_grid = np.asarray(p_grid, dtype=float).reshape(-1, 1)
+        q_grid = 1.0 - p_grid
+        out = {}
+        for j2 in j2_list:
+            m2_vals = np.arange(j2, -j2 - 1, -2, dtype=int).reshape(1, -1)
+            exp_p = ((n + m2_vals) // 2)
+            exp_q = ((n - m2_vals) // 2)
+            out[j2] = (p_grid ** exp_p) * (q_grid ** exp_q)
+        return out
+
+    def _diagonal_transition_matrix_from_choi(self, J: np.ndarray, j2_out: int, j2_in: int):
+        d_out = int(j2_out) + 1
+        d_in = int(j2_in) + 1
+        J = np.asarray(J, dtype=complex)
+        if J.shape != (d_out * d_in, d_out * d_in):
+            raise ValueError(
+                f"Block for (j2_out={j2_out}, j2_in={j2_in}) has shape {J.shape}, "
+                f"expected {(d_out * d_in, d_out * d_in)}."
+            )
+        J4 = J.reshape(d_out, d_in, d_out, d_in)
+        T = np.einsum("aiai->ai", J4)
+        T = ((T + T.conj()) / 2.0).real
+        return np.asarray(T, dtype=float)
+
+    def diagonal_transition_cache(self, J_blocks):
+        cache = {}
+        for j2o in self.j2_out_list:
+            d_out = j2o + 1
+            for j2i in self.j2_in_list:
+                d_in = j2i + 1
+                if (j2o, j2i) not in J_blocks:
+                    cache[(j2o, j2i)] = np.zeros((d_out, d_in), dtype=float)
+                    continue
+                cache[(j2o, j2i)] = self._diagonal_transition_matrix_from_choi(J_blocks[(j2o, j2i)], j2o, j2i)
+        return cache
+
+    def fidelity_curve_blocks(self, J_blocks, p_grid=None, transition_cache=None):
+        if p_grid is None:
+            p_grid = np.linspace(0.5, 1.0, self.p_fine_grid)
+        p_grid = np.asarray(p_grid, dtype=float)
+        if p_grid.ndim != 1:
+            raise ValueError("p_grid must be a 1D array.")
+
+        T = self.diagonal_transition_cache(J_blocks) if transition_cache is None else transition_cache
+        rho_in_grid = self._rho_blocks_grid(self.n_in, self.j2_in_list, p_grid)
+        rho_out_grid = self._rho_blocks_grid(self.n_out, self.j2_out_list, p_grid)
+
+        n_p = p_grid.size
+        root_curve = np.zeros(n_p, dtype=float)
+        for j2o in self.j2_out_list:
+            d_out = j2o + 1
+            sigma_diag = np.zeros((n_p, d_out), dtype=float)
+            for j2i in self.j2_in_list:
+                sigma_diag += self.mult_in[j2i] * (rho_in_grid[j2i] @ T[(j2o, j2i)].T)
+            sigma_diag = np.clip(sigma_diag, 0.0, None)
+            target_diag = np.clip(rho_out_grid[j2o], 0.0, None)
+            root_curve += self.mult_out[j2o] * np.sum(np.sqrt(target_diag * sigma_diag), axis=1)
+        fidelity_curve = root_curve ** 2
+        return p_grid, root_curve, fidelity_curve
+
     def make_problem(self):
         t = cp.Variable()
         constraints = [t >= 0, t <= 1]
@@ -299,13 +360,10 @@ class SolverSDPPerm(Solver):
         for it in range(self.n_rounds):
             t_opt, J_opt = self.solve_one_round() # call self.make_problem() in this method; and self.make_problem() uses self.p_samples.
 
-            # evaluate on fine grid
+            # evaluate on fine grid using the diagonal transfer-matrix fast path
             p_fine = np.linspace(0.5, 1.0, self.p_fine_grid)
-            fvals = []
-            for p in p_fine:
-                sigma_blocks = self._apply_channel_blocks_numpy(J_opt, float(p))
-                fvals.append(self._root_fidelity_full_numpy(float(p), sigma_blocks))
-            fvals = np.array(fvals)
+            _, root_curve, _ = self.fidelity_curve_blocks(J_opt, p_fine)
+            fvals = np.asarray(root_curve, dtype=float)
 
             idx = int(np.argmin(fvals))
             p_worst = float(p_fine[idx])
@@ -501,8 +559,8 @@ class SolverSDPPermSpectrum(SolverSDPPerm):
         self.p_samples = [self.spectrum]
 
         t_opt, J_opt = self.solve_one_round() # call self.make_problem() in this method; and self.make_problem() uses self.p_samples.
-        sigma_blocks = self._apply_channel_blocks_numpy(J_opt, float(self.spectrum))
-        fvals = (self._root_fidelity_full_numpy(float(self.spectrum), sigma_blocks))
+        _, root_curve, _ = self.fidelity_curve_blocks(J_opt, np.asarray([float(self.spectrum)], dtype=float))
+        fvals = float(root_curve[0])
         best = (t_opt, J_opt, self.p_samples, self.p_samples[0], fvals)
 
         return best[1]
@@ -890,11 +948,8 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
             t_opt, coeff_opt, J_opt = self.solve_one_round()
 
             p_fine = np.linspace(0.5, 1.0, self.p_fine_grid)
-            fvals = []
-            for p in p_fine:
-                sigma_blocks = self._apply_channel_blocks_numpy(J_opt, float(p))
-                fvals.append(self._root_fidelity_full_numpy(float(p), sigma_blocks))
-            fvals = np.asarray(fvals, dtype=float)
+            _, root_curve, _ = self.fidelity_curve_blocks(J_opt, p_fine)
+            fvals = np.asarray(root_curve, dtype=float)
 
             idx = int(np.argmin(fvals))
             p_worst = float(p_fine[idx])
@@ -1263,3 +1318,779 @@ def save_all_fixed_irrep_families(
         "saved_pairs": saved_pairs,
         "skipped_pairs": skipped_pairs,
     }
+
+
+class ExactFormulaFixedNuChannel:
+    r"""
+    Exact implementation of
+
+        T_{lambda -> mu}^nu(X)
+          = [dim V_lambda / (c_{lambda,nu}^mu dim Sp_nu dim V_mu)]
+            Pi_mu (X \otimes Pi_nu) Pi_mu
+
+    in the qubit Schur-Weyl setting.
+
+    Internally this class constructs the exact channel on the full sector spaces
+
+        H_lambda = Sp_lambda \otimes V_lambda,
+        H_nu     = Sp_nu \otimes V_nu,
+        H_mu     = Sp_mu \otimes V_mu,
+
+    but the object intended for downstream analysis is the induced/effective local
+    channel on spin spaces only, obtained by averaging over Sp_lambda and tracing
+    out Sp_mu. The block stored under block_key(j2_out, j2_in) is therefore the
+    Choi matrix on V_mu \otimes V_lambda, matching the convention used elsewhere
+    in this optimizer.
+    """
+
+    def __init__(self, n_in, n_out, irrep_in, irrep_out, irrep_nu, verbose=False):
+        if n_out < n_in:
+            raise ValueError("Need n_out >= n_in.")
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.n_anc = int(n_out - n_in)
+        self.verbose = bool(verbose)
+
+        self.j2_in, self.partition_in = self._parse_partition(irrep_in, self.n_in)
+        self.j2_out, self.partition_out = self._parse_partition(irrep_out, self.n_out)
+        self.j2_nu, self.partition_nu = self._parse_partition(irrep_nu, self.n_anc)
+
+        self.dim_Sp_in = mult_qubits(self.n_in, self.j2_in)
+        self.dim_Sp_out = mult_qubits(self.n_out, self.j2_out)
+        self.dim_Sp_nu = mult_qubits(self.n_anc, self.j2_nu)
+
+        self.dim_V_in = self.j2_in + 1
+        self.dim_V_out = self.j2_out + 1
+        self.dim_V_nu = self.j2_nu + 1
+
+        self.dim_sector_in = self.dim_Sp_in * self.dim_V_in
+        self.dim_sector_out = self.dim_Sp_out * self.dim_V_out
+        self.dim_sector_nu = self.dim_Sp_nu * self.dim_V_nu
+
+        self.lr_coeff = int(lr_coeff_qubit_irreps(self.partition_in, self.partition_nu, self.partition_out))
+        if self.lr_coeff == 0:
+            raise ValueError(
+                "LR coefficient is zero for "
+                f"lambda={self.partition_in}, nu={self.partition_nu}, mu={self.partition_out}."
+            )
+
+        self.prefactor = float(self.dim_V_in) / float(self.lr_coeff * self.dim_Sp_nu * self.dim_V_out)
+        self.physical_partition_nu = tuple(self.partition_nu)
+
+        self._basis_in = None
+        self._basis_out = None
+        self._basis_nu = None
+        self._sector_embedding = None
+        self._sector_projector = None
+        self._kraus = None
+        self._sector_choi = None
+        self._full_choi = None
+        self._effective_local_kraus = None
+        self._effective_local_choi = None
+
+    @staticmethod
+    def _parse_partition(label, n):
+        if n == 0:
+            if label in [(), [], "()", "empty", "trivial", 0, "0", "j2=0"]:
+                return 0, ()
+            raise ValueError("For n=0 ancilla, the only allowed irrep label is the trivial one.")
+        return parse_qubit_irrep_label(label, n)
+
+    @staticmethod
+    def _cg_coeff(j2: int, m2: int, ms2: int, J2: int) -> float:
+        j = j2 / 2.0
+        m = m2 / 2.0
+        denom = 2.0 * j + 1.0
+        if J2 == j2 + 1:
+            return math.sqrt((j + m + 1.0) / denom) if ms2 == +1 else math.sqrt((j - m + 1.0) / denom)
+        if J2 == j2 - 1:
+            return -math.sqrt((j - m) / denom) if ms2 == +1 else math.sqrt((j + m) / denom)
+        return 0.0
+
+    @classmethod
+    def _schur_basis_qubits(cls, n: int):
+        if n < 1:
+            raise ValueError("n must be >= 1")
+
+        def j2_list(nq: int):
+            return list(range(nq, nq % 2 - 1, -2))
+
+        def mult(nq: int, j2: int) -> int:
+            from math import comb
+            k = (nq - j2) // 2
+            return comb(nq, k) - (comb(nq, k - 1) if k - 1 >= 0 else 0)
+
+        if n == 1:
+            V = np.eye(2, dtype=complex)
+            labels = [(1, 1, 0), (1, -1, 0)]
+            return V, labels
+
+        V_prev, labels_prev = cls._schur_basis_qubits(n - 1)
+        d_prev = V_prev.shape[0]
+        d = 2 * d_prev
+        vec_prev = {(j2, m2, a): V_prev[:, k] for k, (j2, m2, a) in enumerate(labels_prev)}
+
+        mult_prev = {}
+        for (j2, m2, a) in labels_prev:
+            mult_prev[j2] = max(mult_prev.get(j2, -1), a)
+        for j2 in mult_prev:
+            mult_prev[j2] += 1
+
+        ket_up = np.array([1.0, 0.0], dtype=complex)
+        ket_dn = np.array([0.0, 1.0], dtype=complex)
+        vec_new = {}
+        alpha_counter = {J2: 0 for J2 in j2_list(n)}
+
+        for j2 in j2_list(n - 1):
+            for a in range(mult_prev.get(j2, 0)):
+                for J2 in [j2 + 1, j2 - 1]:
+                    if J2 not in alpha_counter:
+                        continue
+                    if J2 == j2 - 1 and j2 <= 0:
+                        continue
+                    alpha_new = alpha_counter[J2]
+                    alpha_counter[J2] += 1
+                    for M2 in range(J2, -J2 - 1, -2):
+                        v = np.zeros(d, dtype=complex)
+                        for ms2, ket in [(+1, ket_up), (-1, ket_dn)]:
+                            m2 = M2 - ms2
+                            if abs(m2) <= j2 and (j2, m2, a) in vec_prev:
+                                c = cls._cg_coeff(j2, m2, ms2, J2)
+                                v += c * np.kron(vec_prev[(j2, m2, a)], ket)
+                        vec_new[(J2, M2, alpha_new)] = v
+
+        cols, labels = [], []
+        for J2 in j2_list(n):
+            mJ = mult(n, J2)
+            for a in range(mJ):
+                for M2 in range(J2, -J2 - 1, -2):
+                    cols.append(vec_new[(J2, M2, a)])
+                    labels.append((J2, M2, a))
+
+        V = np.column_stack(cols)
+        V = V / np.linalg.norm(V, axis=0, keepdims=True)
+        return V, labels
+
+    @classmethod
+    def _sector_basis_matrix(cls, n: int, j2: int):
+        if n == 0:
+            if j2 != 0:
+                raise ValueError("For n=0 only j2=0 is allowed.")
+            return np.ones((1, 1), dtype=complex)
+        V, labels = cls._schur_basis_qubits(n)
+        cols = [V[:, k] for k, (J2, _, _) in enumerate(labels) if J2 == j2]
+        if not cols:
+            raise ValueError(f"No Schur basis columns found for n={n}, j2={j2}.")
+        return np.column_stack(cols) + 0.0j
+
+    def sector_basis_input(self):
+        if self._basis_in is None:
+            self._basis_in = self._sector_basis_matrix(self.n_in, self.j2_in)
+        return self._basis_in
+
+    def sector_basis_output(self):
+        if self._basis_out is None:
+            self._basis_out = self._sector_basis_matrix(self.n_out, self.j2_out)
+        return self._basis_out
+
+    def sector_basis_nu(self):
+        if self._basis_nu is None:
+            self._basis_nu = self._sector_basis_matrix(self.n_anc, self.j2_nu)
+        return self._basis_nu
+
+    def sector_intertwiner(self):
+        if self._sector_embedding is None:
+            B_in = self.sector_basis_input()
+            B_nu = self.sector_basis_nu()
+            B_out = self.sector_basis_output()
+            self._sector_embedding = B_out.conj().T @ np.kron(B_in, B_nu)
+        return self._sector_embedding
+
+    def sector_projector_in_lambda_tensor_nu(self):
+        if self._sector_projector is None:
+            C = self.sector_intertwiner()
+            P = C.conj().T @ C
+            self._sector_projector = (P + P.conj().T) / 2.0
+        return self._sector_projector
+
+    def kraus_operators(self):
+        if self._kraus is None:
+            C = self.sector_intertwiner()
+            d_in = self.dim_sector_in
+            d_nu = self.dim_sector_nu
+            K_list = []
+            for a in range(d_nu):
+                e = np.zeros((d_nu, 1), dtype=complex)
+                e[a, 0] = 1.0
+                K = math.sqrt(self.prefactor) * (C @ np.kron(np.eye(d_in, dtype=complex), e))
+                K_list.append(np.asarray(K, dtype=complex))
+            self._kraus = K_list
+        return self._kraus
+
+    def apply(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=complex)
+        if X.shape != (self.dim_sector_in, self.dim_sector_in):
+            raise ValueError(f"Input X must have shape {(self.dim_sector_in, self.dim_sector_in)}, got {X.shape}.")
+        out = np.zeros((self.dim_sector_out, self.dim_sector_out), dtype=complex)
+        for K in self.kraus_operators():
+            out += K @ X @ K.conj().T
+        return (out + out.conj().T) / 2.0
+
+    def sector_choi(self) -> np.ndarray:
+        if self._sector_choi is None:
+            d_out = self.dim_sector_out
+            d_in = self.dim_sector_in
+            J = np.zeros((d_out * d_in, d_out * d_in), dtype=complex)
+            for K in self.kraus_operators():
+                vecK = K.reshape(d_out * d_in, order="C")
+                J += np.outer(vecK, vecK.conj())
+            self._sector_choi = (J + J.conj().T) / 2.0
+        return self._sector_choi
+
+    def full_choi_computational(self) -> np.ndarray:
+        if self._full_choi is None:
+            B_out = self.sector_basis_output()
+            B_in = self.sector_basis_input()
+            W = np.kron(B_out, B_in)
+            J_full = W @ self.sector_choi() @ W.conj().T
+            self._full_choi = (J_full + J_full.conj().T) / 2.0
+        return self._full_choi
+
+    def effective_local_kraus_operators(self):
+        if self._effective_local_kraus is None:
+            dS_out, dV_out = self.dim_Sp_out, self.dim_V_out
+            dS_in, dV_in = self.dim_Sp_in, self.dim_V_in
+            scale = 1.0 / math.sqrt(dS_in)
+            ops = []
+            for K in self.kraus_operators():
+                K4 = np.asarray(K, dtype=complex).reshape(dS_out, dV_out, dS_in, dV_in)
+                for s_out in range(dS_out):
+                    for s_in in range(dS_in):
+                        L = scale * np.asarray(K4[s_out, :, s_in, :], dtype=complex)
+                        if np.linalg.norm(L) > 1e-14:
+                            ops.append(L.copy())
+            self._effective_local_kraus = ops
+        return self._effective_local_kraus
+
+    def apply_effective_local(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=complex)
+        if X.shape != (self.dim_V_in, self.dim_V_in):
+            raise ValueError(f"Local input X must have shape {(self.dim_V_in, self.dim_V_in)}, got {X.shape}.")
+        out = np.zeros((self.dim_V_out, self.dim_V_out), dtype=complex)
+        for L in self.effective_local_kraus_operators():
+            out += L @ X @ L.conj().T
+        return (out + out.conj().T) / 2.0
+
+    def effective_local_block_choi(self) -> np.ndarray:
+        if self._effective_local_choi is None:
+            d_out, d_in = self.dim_V_out, self.dim_V_in
+            J = np.zeros((d_out * d_in, d_out * d_in), dtype=complex)
+            for L in self.effective_local_kraus_operators():
+                vecL = np.asarray(L, dtype=complex).reshape(d_out * d_in, order="C")
+                J += np.outer(vecL, vecL.conj())
+            self._effective_local_choi = (J + J.conj().T) / 2.0
+        return self._effective_local_choi
+
+    def verify_tp(self, tol=1e-8):
+        J = self.sector_choi()
+        d_out, d_in = self.dim_sector_out, self.dim_sector_in
+        ptr = np.einsum("o i o j -> i j", J.reshape(d_out, d_in, d_out, d_in))
+        err = np.linalg.norm(ptr - np.eye(d_in, dtype=complex))
+        return err <= tol, float(err)
+
+    def verify_effective_local_tp(self, tol=1e-8):
+        J = self.effective_local_block_choi()
+        d_out, d_in = self.dim_V_out, self.dim_V_in
+        ptr = np.einsum("o i o j -> i j", J.reshape(d_out, d_in, d_out, d_in))
+        err = np.linalg.norm(ptr - np.eye(d_in, dtype=complex))
+        return err <= tol, float(err)
+
+    def normalized_local_input_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_in, self.j2_in, float(p))
+        z = float(np.trace(rho_spin).real)
+        if z <= 0:
+            return None
+        rho_spin = rho_spin / z
+        return np.kron(np.eye(self.dim_Sp_in, dtype=complex) / self.dim_Sp_in, rho_spin)
+
+    def normalized_local_target_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_out, self.j2_out, float(p))
+        z = float(np.trace(rho_spin).real)
+        if z <= 0:
+            return None
+        rho_spin = rho_spin / z
+        return np.kron(np.eye(self.dim_Sp_out, dtype=complex) / self.dim_Sp_out, rho_spin)
+
+    def normalized_effective_local_input_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_in, self.j2_in, float(p))
+        z = float(np.trace(rho_spin).real)
+        if z <= 0:
+            return None
+        return rho_spin / z
+
+    def normalized_effective_local_target_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_out, self.j2_out, float(p))
+        z = float(np.trace(rho_spin).real)
+        if z <= 0:
+            return None
+        return rho_spin / z
+
+    def fidelity_curve(self, p_grid):
+        p_grid = np.asarray(p_grid, dtype=float)
+        roots = []
+        kept = []
+        for p in p_grid:
+            rho_in = self.normalized_local_input_state(float(p))
+            rho_out = self.normalized_local_target_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            sigma = self.apply(rho_in)
+            roots.append(fidelity_root_numpy(rho_out, sigma))
+            kept.append(float(p))
+        return np.asarray(kept, dtype=float), np.asarray(roots, dtype=float)
+
+    def effective_local_fidelity_curve(self, p_grid):
+        p_grid = np.asarray(p_grid, dtype=float)
+        roots = []
+        kept = []
+        for p in p_grid:
+            rho_in = self.normalized_effective_local_input_state(float(p))
+            rho_out = self.normalized_effective_local_target_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            sigma = self.apply_effective_local(rho_in)
+            roots.append(fidelity_root_numpy(rho_out, sigma))
+            kept.append(float(p))
+        return np.asarray(kept, dtype=float), np.asarray(roots, dtype=float)
+
+    def describe(self) -> str:
+        ok, err = self.verify_effective_local_tp()
+        lines = [
+            f"Exact formula channel: lambda={self.partition_in} -> mu={self.partition_out}, nu={self.partition_nu}",
+            "prefactor = dim(V_lambda) / (c_{lambda,nu}^mu dim(Sp_nu) dim(V_mu)) "
+            f"= {self.dim_V_in} / ({self.lr_coeff} * {self.dim_Sp_nu} * {self.dim_V_out}) = {self.prefactor:.10f}",
+            f"effective local dims: d_in={self.dim_V_in}, d_out={self.dim_V_out}; full sector dims: in={self.dim_sector_in}, nu={self.dim_sector_nu}, out={self.dim_sector_out}",
+            f"Effective-local TP check: {ok} (error {err:.3e})",
+        ]
+        return "\n".join(lines)
+
+    def get_result(self):
+        ok, err = self.verify_effective_local_tp()
+        result = {
+            "n_in": int(self.n_in),
+            "n_out": int(self.n_out),
+            "n_anc": int(self.n_anc),
+            "j2_in": int(self.j2_in),
+            "j2_out": int(self.j2_out),
+            "j2_nu": int(self.j2_nu),
+            "partition_in": tuple(self.partition_in),
+            "partition_out": tuple(self.partition_out),
+            "partition_nu": tuple(self.partition_nu),
+            "physical_partition_nu": tuple(self.partition_nu),
+            "nu_matches_physical_ancilla": True,
+            "dim_Sp_in": int(self.dim_Sp_in),
+            "dim_Sp_out": int(self.dim_Sp_out),
+            "dim_Sp_nu": int(self.dim_Sp_nu),
+            "dim_V_in": int(self.dim_V_in),
+            "dim_V_out": int(self.dim_V_out),
+            "dim_V_nu": int(self.dim_V_nu),
+            "dim_sector_in": int(self.dim_sector_in),
+            "dim_sector_out": int(self.dim_sector_out),
+            "dim_sector_nu": int(self.dim_sector_nu),
+            "lr_coeff": int(self.lr_coeff),
+            "prefactor": float(self.prefactor),
+            "tp_ok": bool(ok),
+            "tp_error": float(err),
+        }
+        result[block_key(self.j2_out, self.j2_in)] = np.asarray(self.effective_local_block_choi(), dtype=complex)
+        return result
+
+    def save_result(self, path: str):
+        result = self.get_result()
+        save_local_irrep_result(path, result, result[block_key(self.j2_out, self.j2_in)])
+        return path
+
+
+class ExactFormulaIrrepFamily:
+    """Build ExactFormulaFixedNuChannel for every physical nu with c_{lambda,nu}^mu != 0."""
+
+    def __init__(self, n_in, n_out, irrep_in, irrep_out, verbose=False):
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.n_anc = int(n_out - n_in)
+        self.verbose = bool(verbose)
+        self.j2_in, self.partition_in = parse_qubit_irrep_label(irrep_in, self.n_in)
+        self.j2_out, self.partition_out = parse_qubit_irrep_label(irrep_out, self.n_out)
+        self.nu_partitions = []
+        for j2_nu in j2_list_for_n_qubits(self.n_anc):
+            part_nu = tuple(j2_to_qubit_partition(self.n_anc, j2_nu))
+            c = lr_coeff_qubit_irreps(self.partition_in, part_nu, self.partition_out)
+            if c != 0:
+                self.nu_partitions.append(part_nu)
+        self._channels = None
+
+    def build(self):
+        if self._channels is None:
+            self._channels = {}
+            for part_nu in self.nu_partitions:
+                self._channels[tuple(part_nu)] = ExactFormulaFixedNuChannel(
+                    n_in=self.n_in, n_out=self.n_out,
+                    irrep_in=self.partition_in, irrep_out=self.partition_out,
+                    irrep_nu=part_nu, verbose=self.verbose,
+                )
+        return self._channels
+
+    def get_channel(self, irrep_nu):
+        channels = self.build()
+        _, part_nu = ExactFormulaFixedNuChannel._parse_partition(irrep_nu, self.n_anc)
+        return channels[tuple(part_nu)]
+
+    def get_all_results(self):
+        return {part_nu: ch.get_result() for part_nu, ch in self.build().items()}
+
+
+class AbstractSpinOnlyExactFormulaFixedNuChannel:
+    r"""
+    Abstract exact spin-sector channel for arbitrary auxiliary SU(2) irrep label nu.
+
+    This fallback is used when the input/output multiplicity spaces are both trivial
+    (dim Sp_lambda = dim Sp_mu = 1), so that the exact formula reduces to the pure
+    SU(2)-spin part. In that regime we can allow non-physical auxiliary labels nu,
+    represented canonically by one-row partitions (j2_nu,).
+    """
+    def __init__(self, n_in, n_out, irrep_in, irrep_out, irrep_nu, verbose=False):
+        if n_out < n_in:
+            raise ValueError("Need n_out >= n_in.")
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.n_anc = int(n_out - n_in)
+        self.verbose = bool(verbose)
+        self.j2_in, self.partition_in = parse_qubit_irrep_label(irrep_in, self.n_in)
+        self.j2_out, self.partition_out = parse_qubit_irrep_label(irrep_out, self.n_out)
+        self.j2_nu, self.partition_nu = parse_auxiliary_qubit_irrep_label(irrep_nu)
+        self.dim_Sp_in = mult_qubits(self.n_in, self.j2_in)
+        self.dim_Sp_out = mult_qubits(self.n_out, self.j2_out)
+        if self.dim_Sp_in != 1 or self.dim_Sp_out != 1:
+            raise ValueError("AbstractSpinOnlyExactFormulaFixedNuChannel currently requires dim Sp_lambda = dim Sp_mu = 1.")
+        self.dim_Sp_nu = 1
+        self.dim_V_in = self.j2_in + 1
+        self.dim_V_out = self.j2_out + 1
+        self.dim_V_nu = self.j2_nu + 1
+        self.dim_sector_in = self.dim_V_in
+        self.dim_sector_out = self.dim_V_out
+        self.dim_sector_nu = self.dim_V_nu
+        if not (abs(self.j2_in - self.j2_nu) <= self.j2_out <= self.j2_in + self.j2_nu and (self.j2_in + self.j2_nu - self.j2_out) % 2 == 0):
+            raise ValueError(f"No SU(2) coupling from j2_in={self.j2_in} and j2_nu={self.j2_nu} to j2_out={self.j2_out}.")
+        self.lr_coeff = 1
+        self.prefactor = float(self.dim_V_in) / float(self.dim_V_out)
+        self.physical_partition_nu = None
+        if self.j2_nu in j2_list_for_n_qubits(self.n_anc):
+            self.physical_partition_nu = tuple(j2_to_qubit_partition(self.n_anc, self.j2_nu))
+        self._coisometry = None
+        self._kraus = None
+        self._sector_choi = None
+
+    @staticmethod
+    def _spin_coupling_coisometry(j2_in: int, j2_nu: int, j2_out: int, tol: float = 1e-8):
+        d_in = j2_in + 1
+        d_nu = j2_nu + 1
+        d_out = j2_out + 1
+        I_in = np.eye(d_in, dtype=complex)
+        I_nu = np.eye(d_nu, dtype=complex)
+        Sx_i, Sy_i, Sz_i = spin_matrices_from_j2(j2_in)
+        Sx_n, Sy_n, Sz_n = spin_matrices_from_j2(j2_nu)
+        Jx = np.kron(Sx_i, I_nu) + np.kron(I_in, Sx_n)
+        Jy = np.kron(Sy_i, I_nu) + np.kron(I_in, Sy_n)
+        Jz = np.kron(Sz_i, I_nu) + np.kron(I_in, Sz_n)
+        J2 = (Jx @ Jx + Jy @ Jy + Jz @ Jz)
+        J2 = (J2 + J2.conj().T) / 2.0
+        target = (j2_out / 2.0) * (j2_out / 2.0 + 1.0)
+        evals, evecs = np.linalg.eigh(J2)
+        idx = np.where(np.abs(evals - target) <= tol)[0]
+        if len(idx) != d_out:
+            raise RuntimeError(f"Unexpected SU(2) coupling multiplicity for (j2_in={j2_in}, j2_nu={j2_nu}, j2_out={j2_out}): found eigenspace dimension {len(idx)}, expected {d_out}.")
+        Q = np.asarray(evecs[:, idx], dtype=complex)
+        Jz_sub = (Q.conj().T @ Jz @ Q)
+        Jz_sub = (Jz_sub + Jz_sub.conj().T) / 2.0
+        mz_vals, W = np.linalg.eigh(Jz_sub)
+        order = np.argsort(-mz_vals)
+        U = Q @ W[:, order]
+        desired_m = np.arange(j2_out / 2.0, -j2_out / 2.0 - 1, -1.0)
+        if np.max(np.abs(mz_vals[order] - desired_m)) > 1e-6:
+            raise RuntimeError(f"Failed to order Jz basis for (j2_in={j2_in}, j2_nu={j2_nu}, j2_out={j2_out}).")
+        return U.conj().T
+
+    def sector_intertwiner(self):
+        if self._coisometry is None:
+            self._coisometry = self._spin_coupling_coisometry(self.j2_in, self.j2_nu, self.j2_out)
+        return self._coisometry
+
+    def sector_projector_in_lambda_tensor_nu(self):
+        C = self.sector_intertwiner()
+        return (C.conj().T @ C + (C.conj().T @ C).conj().T) / 2.0
+
+    def kraus_operators(self):
+        if self._kraus is None:
+            C = self.sector_intertwiner()
+            d_in, d_nu = self.dim_sector_in, self.dim_sector_nu
+            out = []
+            for a in range(d_nu):
+                e = np.zeros((d_nu, 1), dtype=complex)
+                e[a, 0] = 1.0
+                out.append(np.asarray(math.sqrt(self.prefactor) * (C @ np.kron(np.eye(d_in, dtype=complex), e)), dtype=complex))
+            self._kraus = out
+        return self._kraus
+
+    def apply(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=complex)
+        if X.shape != (self.dim_sector_in, self.dim_sector_in):
+            raise ValueError(f"Input X must have shape {(self.dim_sector_in, self.dim_sector_in)}, got {X.shape}.")
+        out = np.zeros((self.dim_sector_out, self.dim_sector_out), dtype=complex)
+        for K in self.kraus_operators():
+            out += K @ X @ K.conj().T
+        return (out + out.conj().T) / 2.0
+
+    def sector_choi(self) -> np.ndarray:
+        if self._sector_choi is None:
+            d_out, d_in = self.dim_sector_out, self.dim_sector_in
+            J = np.zeros((d_out * d_in, d_out * d_in), dtype=complex)
+            for K in self.kraus_operators():
+                vecK = K.reshape(d_out * d_in, order="C")
+                J += np.outer(vecK, vecK.conj())
+            self._sector_choi = (J + J.conj().T) / 2.0
+        return self._sector_choi
+
+    # Unified effective-local aliases (already spin-only).
+    def effective_local_kraus_operators(self):
+        return self.kraus_operators()
+    def apply_effective_local(self, X: np.ndarray) -> np.ndarray:
+        return self.apply(X)
+    def effective_local_block_choi(self) -> np.ndarray:
+        return self.sector_choi()
+    def verify_tp(self, tol=1e-8):
+        J = self.sector_choi()
+        d_out, d_in = self.dim_sector_out, self.dim_sector_in
+        ptr = np.einsum("o i o j -> i j", J.reshape(d_out, d_in, d_out, d_in))
+        err = np.linalg.norm(ptr - np.eye(d_in, dtype=complex))
+        return err <= tol, float(err)
+    def verify_effective_local_tp(self, tol=1e-8):
+        return self.verify_tp(tol)
+    def normalized_local_input_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_in, self.j2_in, float(p))
+        z = float(np.trace(rho_spin).real)
+        return None if z <= 0 else rho_spin / z
+    def normalized_local_target_state(self, p: float) -> np.ndarray:
+        rho_spin = rho_block_diag_in_spin_irrep(self.n_out, self.j2_out, float(p))
+        z = float(np.trace(rho_spin).real)
+        return None if z <= 0 else rho_spin / z
+    def normalized_effective_local_input_state(self, p: float) -> np.ndarray:
+        return self.normalized_local_input_state(p)
+    def normalized_effective_local_target_state(self, p: float) -> np.ndarray:
+        return self.normalized_local_target_state(p)
+    def fidelity_curve(self, p_grid):
+        p_grid = np.asarray(p_grid, dtype=float)
+        roots, kept = [], []
+        for p in p_grid:
+            rho_in = self.normalized_local_input_state(float(p))
+            rho_out = self.normalized_local_target_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            roots.append(fidelity_root_numpy(rho_out, self.apply(rho_in)))
+            kept.append(float(p))
+        return np.asarray(kept, dtype=float), np.asarray(roots, dtype=float)
+    def effective_local_fidelity_curve(self, p_grid):
+        return self.fidelity_curve(p_grid)
+
+
+class SolverExactIrrepFamily:
+    """
+    Build all exact maps for a fixed input/output irrep pair.
+
+    Priority order:
+    1) literal physical exact maps with nu \vdash (n_out-n_in) and LR != 0;
+    2) if dim Sp_lambda = dim Sp_mu = 1, also allow abstract spin-only auxiliary
+       sectors indexed by j2_nu, saved using canonical one-row partitions (j2_nu,).
+
+    The block stored under block_key(j2_out, j2_in) is always the effective local
+    block Choi on V_mu \otimes V_lambda, so it can be used directly by the same
+    downstream analysis code as the other local/fixed-irrep solvers.
+    """
+    def __init__(self, n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=101, n_rounds=1, irrep_in=None, irrep_out=None, cache_dir="data/exact_irrep"):
+        if dim != 2:
+            raise ValueError("SolverExactIrrepFamily currently supports only qubits (dim=2).")
+        if irrep_in is None or irrep_out is None:
+            raise ValueError("SolverExactIrrepFamily requires both irrep_in and irrep_out.")
+        if n_out < n_in:
+            raise ValueError("Need n_out >= n_in.")
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.n_anc = int(n_out - n_in)
+        self.dim = int(dim)
+        self.verbose = bool(verbose)
+        self.p_init_grid = int(p_init_grid)
+        self.p_fine_grid = int(p_fine_grid)
+        self.n_rounds = int(n_rounds)
+        self.cache_dir = cache_dir
+        self.j2_in, self.partition_in = parse_qubit_irrep_label(irrep_in, self.n_in)
+        self.j2_out, self.partition_out = parse_qubit_irrep_label(irrep_out, self.n_out)
+        self.dim_Sp_in = mult_qubits(self.n_in, self.j2_in)
+        self.dim_Sp_out = mult_qubits(self.n_out, self.j2_out)
+        self.nu_entries = []
+        for j2_nu in j2_list_for_n_qubits(self.n_anc):
+            part_nu = tuple(j2_to_qubit_partition(self.n_anc, j2_nu))
+            c = lr_coeff_qubit_irreps(self.partition_in, part_nu, self.partition_out)
+            if c != 0:
+                self.nu_entries.append({"mode": "physical", "partition_nu": part_nu, "j2_nu": int(j2_nu)})
+        if self.dim_Sp_in == 1 and self.dim_Sp_out == 1:
+            allowed_j2 = [int(L2) for (L2, _) in su2_commutant_projectors(self.j2_out, self.j2_in)]
+            seen = {tuple(entry["partition_nu"]) for entry in self.nu_entries}
+            for j2_nu in allowed_j2:
+                part_nu = tuple(canonical_qubit_aux_partition(j2_nu))
+                if part_nu in seen:
+                    continue
+                self.nu_entries.append({"mode": "abstract_spin_only", "partition_nu": part_nu, "j2_nu": int(j2_nu)})
+                seen.add(part_nu)
+        self._results_by_partition_nu = None
+        self._blocks_by_partition_nu = None
+
+    def admissible_nu_labels(self):
+        return [{"j2_nu": int(e["j2_nu"]), "partition_nu": tuple(e["partition_nu"]), "mode": e["mode"]} for e in self.nu_entries]
+
+    def _cache_path_for_nu(self, part_nu):
+        part_in = str(tuple(self.partition_in)).replace(" ", "")
+        part_out = str(tuple(self.partition_out)).replace(" ", "")
+        part_nu_s = str(tuple(part_nu)).replace(" ", "")
+        return os.path.join(self.cache_dir, f"{self.n_in}_to_{self.n_out}_{part_in}_to_{part_out}_nu_{part_nu_s}.npz")
+
+    def _build_channel(self, entry):
+        if entry["mode"] == "physical":
+            return ExactFormulaFixedNuChannel(self.n_in, self.n_out, self.partition_in, self.partition_out, entry["partition_nu"], verbose=self.verbose)
+        if entry["mode"] == "abstract_spin_only":
+            return AbstractSpinOnlyExactFormulaFixedNuChannel(self.n_in, self.n_out, self.partition_in, self.partition_out, entry["partition_nu"], verbose=self.verbose)
+        raise ValueError(f"Unknown exact-irrep nu mode: {entry['mode']}")
+
+    def _result_dict_for_exact_nu(self, entry):
+        ch = self._build_channel(entry)
+        p_samples = sorted(set(np.linspace(0.5, 1.0, self.p_init_grid).tolist()))
+        sampled_roots = []
+        for p in p_samples:
+            rho_in = ch.normalized_effective_local_input_state(float(p))
+            rho_out = ch.normalized_effective_local_target_state(float(p))
+            if rho_in is None or rho_out is None:
+                continue
+            sampled_roots.append(fidelity_root_numpy(rho_out, ch.apply_effective_local(rho_in)))
+        sampled_root_lb = 0.0 if len(sampled_roots) == 0 else float(np.min(np.asarray(sampled_roots, dtype=float)))
+        p_curve, root_curve = ch.effective_local_fidelity_curve(np.linspace(0.5, 1.0, self.p_fine_grid))
+        if root_curve.size == 0:
+            worst_p, worst_root = 1.0, 0.0
+        else:
+            idx = int(np.argmin(root_curve))
+            worst_p = float(p_curve[idx])
+            worst_root = float(root_curve[idx])
+        ok, err = ch.verify_effective_local_tp()
+        result = {
+            "n_in": int(self.n_in), "n_out": int(self.n_out), "n_anc": int(self.n_anc),
+            "j2_in": int(ch.j2_in), "j2_out": int(ch.j2_out), "j2_nu": int(ch.j2_nu),
+            "partition_in": tuple(ch.partition_in), "partition_out": tuple(ch.partition_out),
+            "partition_nu": tuple(ch.partition_nu),
+            "physical_partition_nu": getattr(ch, "physical_partition_nu", None),
+            "nu_matches_physical_ancilla": getattr(ch, "physical_partition_nu", None) is not None and tuple(ch.partition_nu) == tuple(getattr(ch, "physical_partition_nu", ()) or ()),
+            "worst_p": float(worst_p), "worst_fidelity": float(worst_root ** 2),
+            "sampled_fidelity": float(sampled_root_lb ** 2),
+            "fidelity_curve_p": np.asarray(p_curve, dtype=float),
+            "fidelity_curve_root": np.asarray(root_curve, dtype=float),
+            "weights": {}, "local_choi_basis": {}, "exact_formula_mode": entry["mode"],
+            "dim_Sp_in": int(ch.dim_Sp_in), "dim_Sp_out": int(ch.dim_Sp_out), "dim_Sp_nu": int(ch.dim_Sp_nu),
+            "dim_V_in": int(ch.dim_V_in), "dim_V_out": int(ch.dim_V_out), "dim_V_nu": int(ch.dim_V_nu),
+            "dim_sector_in": int(ch.dim_sector_in), "dim_sector_out": int(ch.dim_sector_out), "dim_sector_nu": int(ch.dim_sector_nu),
+            "lr_coeff": int(getattr(ch, "lr_coeff", 1)), "prefactor": float(ch.prefactor),
+            "tp_ok": bool(ok), "tp_error": float(err),
+        }
+        result[block_key(ch.j2_out, ch.j2_in)] = np.asarray(ch.effective_local_block_choi(), dtype=complex)
+        return result
+
+    def solve(self):
+        if self._blocks_by_partition_nu is not None:
+            return self._blocks_by_partition_nu
+        results, blocks = {}, {}
+        for entry in self.nu_entries:
+            part_nu = tuple(entry["partition_nu"])
+            result = self._result_dict_for_exact_nu(entry)
+            results[part_nu] = result
+            blocks[part_nu] = {(self.j2_out, self.j2_in): np.asarray(result[block_key(self.j2_out, self.j2_in)], dtype=complex)}
+            if self.verbose:
+                print(f"[exact nu] {self.partition_in} -> {self.partition_out}, nu={part_nu}, mode={entry['mode']}, worst F≈{result['worst_fidelity']:.8f}, tp_error={result['tp_error']:.3e}")
+        self._results_by_partition_nu = results
+        self._blocks_by_partition_nu = blocks
+        return self._blocks_by_partition_nu
+
+    def get_solution(self):
+        return self.solve()
+    def get_solution_blocks(self):
+        return self.solve()
+    def get_result(self, irrep_nu):
+        self.solve()
+        j2_nu, part_nu = parse_auxiliary_qubit_irrep_label(irrep_nu)
+        if tuple(part_nu) in self._results_by_partition_nu:
+            return self._results_by_partition_nu[tuple(part_nu)]
+        return self._results_by_partition_nu[tuple(canonical_qubit_aux_partition(j2_nu))]
+    def get_all_results(self):
+        self.solve()
+        return self._results_by_partition_nu
+    def save_result(self, irrep_nu, path=None):
+        result = self.get_result(irrep_nu)
+        part_nu = tuple(result["partition_nu"])
+        if path is None:
+            path = self._cache_path_for_nu(part_nu)
+        save_local_irrep_result(path, result, result[block_key(self.j2_out, self.j2_in)])
+        return path
+    def save_all_results(self):
+        self.solve()
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        saved = {}
+        for entry in self.nu_entries:
+            part_nu = tuple(entry["partition_nu"])
+            path = self._cache_path_for_nu(part_nu)
+            result = self._results_by_partition_nu[part_nu]
+            save_local_irrep_result(path, result, result[block_key(self.j2_out, self.j2_in)])
+            saved[part_nu] = path
+        return saved
+    def describe_results(self):
+        self.solve()
+        lines = [f"Exact irrep family for input {self.partition_in} (j2={self.j2_in}) -> output {self.partition_out} (j2={self.j2_out})"]
+        for entry in self.nu_entries:
+            part_nu = tuple(entry["partition_nu"])
+            result = self._results_by_partition_nu[part_nu]
+            lines.append(f"  nu={part_nu}, mode={entry['mode']}: worst_F≈{result['worst_fidelity']:.10f}, worst_p≈{result['worst_p']:.10f}, tp_error≈{result['tp_error']:.3e}")
+        return "\n".join(lines)
+
+
+def save_all_exact_irrep_families(n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=101, n_rounds=1, cache_dir="data/exact_irrep", skip_empty=True):
+    os.makedirs(cache_dir, exist_ok=True)
+    input_parts = [tuple(j2_to_qubit_partition(n_in, j2)) for j2 in j2_list_for_n_qubits(n_in)]
+    output_parts = [tuple(j2_to_qubit_partition(n_out, j2)) for j2 in j2_list_for_n_qubits(n_out)]
+    saved_files, saved_pairs, skipped_pairs = [], [], []
+    for part_in in input_parts:
+        for part_out in output_parts:
+            try:
+                solver = SolverExactIrrepFamily(n_in=n_in, n_out=n_out, dim=dim, verbose=verbose, p_init_grid=p_init_grid, p_fine_grid=p_fine_grid, n_rounds=n_rounds, irrep_in=part_in, irrep_out=part_out, cache_dir=cache_dir)
+                admissible = solver.admissible_nu_labels()
+                if len(admissible) == 0:
+                    msg = "no admissible nu"
+                    skipped_pairs.append((part_in, part_out, msg))
+                    if verbose:
+                        print(f"[skip] {part_in} -> {part_out}: {msg}")
+                    if skip_empty:
+                        continue
+                saved = solver.save_all_results()
+                saved_paths = list(saved.values())
+                saved_files.extend(saved_paths)
+                saved_pairs.append((part_in, part_out))
+                if verbose:
+                    print(f"[saved exact] {part_in} -> {part_out}: {len(saved_paths)} file(s), nus={admissible}")
+            except Exception as e:
+                skipped_pairs.append((part_in, part_out, str(e)))
+                print(f"[error] exact {part_in} -> {part_out}: {e}")
+    return {"saved_files": saved_files, "saved_pairs": saved_pairs, "skipped_pairs": skipped_pairs}
+

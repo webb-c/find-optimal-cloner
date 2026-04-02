@@ -295,12 +295,19 @@ def canonical_qubit_aux_partition(j2: int):
     return (j2,) if j2 > 0 else (1, 1)
 
 
-def normalized_spin_irrep_state(n: int, j2: int, p: float, tol: float = 1e-12):
+def normalized_spin_irrep_state(n: int, j2: int, p: float, tol: float = 1e-12, normalize=True):
     p = float(p)
     block = rho_block_diag_in_spin_irrep(n, j2, p)
+    if not normalize:
+        return block
+    
     z = float(np.trace(block).real)
     if z > tol:
-        return block / z
+        if normalize:
+            return block / z
+        else:
+            return block 
+        
     if p >= 1.0 - tol:
         out = np.zeros((j2 + 1, j2 + 1), dtype=complex)
         out[0, 0] = 1.0
@@ -385,6 +392,40 @@ def save_local_irrep_result(path: str, result: dict, J=None):
         save_dict["fidelity_curve_p"] = np.asarray(result["fidelity_curve_p"], dtype=float)
     if "fidelity_curve_root" in result:
         save_dict["fidelity_curve_root"] = np.asarray(result["fidelity_curve_root"], dtype=float)
+    if "n_anc" in result:
+        save_dict["n_anc"] = np.array(result["n_anc"], dtype=int)
+    if "dim_Sp_in" in result:
+        save_dict["dim_Sp_in"] = np.array(result["dim_Sp_in"], dtype=int)
+    if "dim_Sp_out" in result:
+        save_dict["dim_Sp_out"] = np.array(result["dim_Sp_out"], dtype=int)
+    if "dim_Sp_nu" in result:
+        save_dict["dim_Sp_nu"] = np.array(result["dim_Sp_nu"], dtype=int)
+    if "dim_V_in" in result:
+        save_dict["dim_V_in"] = np.array(result["dim_V_in"], dtype=int)
+    if "dim_V_out" in result:
+        save_dict["dim_V_out"] = np.array(result["dim_V_out"], dtype=int)
+    if "dim_V_nu" in result:
+        save_dict["dim_V_nu"] = np.array(result["dim_V_nu"], dtype=int)
+    if "dim_sector_in" in result:
+        save_dict["dim_sector_in"] = np.array(result["dim_sector_in"], dtype=int)
+    if "dim_sector_out" in result:
+        save_dict["dim_sector_out"] = np.array(result["dim_sector_out"], dtype=int)
+    if "dim_sector_nu" in result:
+        save_dict["dim_sector_nu"] = np.array(result["dim_sector_nu"], dtype=int)
+    if "lr_coeff" in result:
+        save_dict["lr_coeff"] = np.array(result["lr_coeff"], dtype=int)
+    if "prefactor" in result:
+        save_dict["prefactor"] = np.array(result["prefactor"], dtype=float)
+    if "tp_ok" in result:
+        save_dict["tp_ok"] = np.array(bool(result["tp_ok"]))
+    if "tp_error" in result:
+        save_dict["tp_error"] = np.array(result["tp_error"], dtype=float)
+    if "full_choi_computational" in result:
+        save_dict["full_choi_computational"] = np.asarray(result["full_choi_computational"], dtype=complex)
+    if "intertwiner" in result:
+        save_dict["intertwiner"] = np.asarray(result["intertwiner"], dtype=complex)
+    if "branching_projector" in result:
+        save_dict["branching_projector"] = np.asarray(result["branching_projector"], dtype=complex)
 
     for L2, val in result.get("weights", {}).items():
         save_dict[f"weight_L2_{int(L2)}"] = np.array(float(val), dtype=float)
@@ -435,6 +476,21 @@ def load_local_irrep_result(path: str):
         result["physical_partition_nu"] = tuple(int(x) for x in np.asarray(data["physical_partition_nu"]).tolist())
     if "nu_matches_physical_ancilla" in data:
         result["nu_matches_physical_ancilla"] = bool(np.asarray(data["nu_matches_physical_ancilla"]).item())
+    for key in [
+        "n_anc", "dim_Sp_in", "dim_Sp_out", "dim_Sp_nu",
+        "dim_V_in", "dim_V_out", "dim_V_nu",
+        "dim_sector_in", "dim_sector_out", "dim_sector_nu", "lr_coeff"
+    ]:
+        if key in data:
+            result[key] = int(np.asarray(data[key]).item())
+    for key in ["prefactor", "tp_error"]:
+        if key in data:
+            result[key] = float(np.asarray(data[key]).item())
+    if "tp_ok" in data:
+        result["tp_ok"] = bool(np.asarray(data["tp_ok"]).item())
+    for key in ["full_choi_computational", "intertwiner", "branching_projector"]:
+        if key in data:
+            result[key] = np.asarray(data[key])
     return result
 
 def partition_n_boxes(partition):
@@ -549,3 +605,129 @@ def fixed_irrep_channel_local_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
         "lr_coeff_physical_ancilla": None if lr_coeff is None else int(lr_coeff),
         "local_choi": np.asarray(chosen, dtype=complex),
     }
+
+
+# ==============================
+# Extended exact-irrep metadata IO
+# ==============================
+
+def save_local_irrep_result(path: str, result: dict, J=None):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    choi_key = block_key(result["j2_out"], result["j2_in"])
+    if J is None:
+        if choi_key not in result:
+            raise ValueError(f"Missing Choi block '{choi_key}' in result and no explicit J was provided.")
+        J = result[choi_key]
+
+    save_dict = {
+        "n_in": np.array(result["n_in"], dtype=int),
+        "n_out": np.array(result["n_out"], dtype=int),
+        "j2_in": np.array(result["j2_in"], dtype=int),
+        "j2_out": np.array(result["j2_out"], dtype=int),
+        "worst_p": np.array(result["worst_p"], dtype=float),
+        "worst_fidelity": np.array(result["worst_fidelity"], dtype=float),
+        "sampled_fidelity": np.array(result.get("sampled_fidelity", 0.0), dtype=float),
+        choi_key: np.asarray(J, dtype=complex),
+    }
+    if "partition_in" in result:
+        save_dict["partition_in"] = np.asarray(result["partition_in"], dtype=int)
+    if "partition_out" in result:
+        save_dict["partition_out"] = np.asarray(result["partition_out"], dtype=int)
+    if "j2_nu" in result:
+        save_dict["j2_nu"] = np.array(result["j2_nu"], dtype=int)
+    if "partition_nu" in result:
+        save_dict["partition_nu"] = np.asarray(result["partition_nu"], dtype=int)
+    if "physical_partition_nu" in result and result["physical_partition_nu"] is not None:
+        save_dict["physical_partition_nu"] = np.asarray(result["physical_partition_nu"], dtype=int)
+    if "nu_matches_physical_ancilla" in result:
+        save_dict["nu_matches_physical_ancilla"] = np.array(bool(result["nu_matches_physical_ancilla"]))
+    if "fidelity_curve_p" in result:
+        save_dict["fidelity_curve_p"] = np.asarray(result["fidelity_curve_p"], dtype=float)
+    if "fidelity_curve_root" in result:
+        save_dict["fidelity_curve_root"] = np.asarray(result["fidelity_curve_root"], dtype=float)
+    if "exact_formula_mode" in result:
+        save_dict["exact_formula_mode"] = np.array(str(result["exact_formula_mode"]))
+    for key in [
+        "tp_ok", "tp_error", "prefactor", "lr_coeff",
+        "dim_Sp_in", "dim_Sp_out", "dim_Sp_nu",
+        "dim_V_in", "dim_V_out", "dim_V_nu",
+        "dim_sector_in", "dim_sector_out", "dim_sector_nu",
+    ]:
+        if key in result:
+            val = result[key]
+            if isinstance(val, bool):
+                save_dict[key] = np.array(val)
+            elif isinstance(val, (int, np.integer)):
+                save_dict[key] = np.array(int(val), dtype=int)
+            else:
+                save_dict[key] = np.array(val, dtype=float)
+
+    for L2, val in result.get("weights", {}).items():
+        save_dict[f"weight_L2_{int(L2)}"] = np.array(float(val), dtype=float)
+    for L2, B in result.get("local_choi_basis", {}).items():
+        save_dict[f"basis_L2_{int(L2)}"] = np.asarray(B, dtype=complex)
+    np.savez_compressed(path, **save_dict)
+
+
+def load_local_irrep_result(path: str):
+    raw = np.load(path, allow_pickle=True)
+    data = {k: raw[k] for k in raw.files}
+
+    j2_out = int(np.asarray(data["j2_out"]).item())
+    j2_in = int(np.asarray(data["j2_in"]).item())
+    choi_key = block_key(j2_out, j2_in)
+
+    weights = {}
+    basis = {}
+    for k, v in data.items():
+        if k.startswith("weight_L2_"):
+            weights[int(k.split("_")[-1])] = float(np.asarray(v).item())
+        elif k.startswith("basis_L2_"):
+            basis[int(k.split("_")[-1])] = np.asarray(v)
+
+    result = {
+        "n_in": int(np.asarray(data["n_in"]).item()),
+        "n_out": int(np.asarray(data["n_out"]).item()),
+        "j2_in": j2_in,
+        "j2_out": j2_out,
+        "worst_p": float(np.asarray(data.get("worst_p", 1.0)).item()),
+        "worst_fidelity": float(np.asarray(data.get("worst_fidelity", 0.0)).item()),
+        "weights": weights,
+        "local_choi_basis": basis,
+        "sampled_fidelity": float(np.asarray(data.get("sampled_fidelity", 0.0)).item()),
+        "fidelity_curve_p": np.asarray(data.get("fidelity_curve_p", np.array([], dtype=float)), dtype=float),
+        "fidelity_curve_root": np.asarray(data.get("fidelity_curve_root", np.array([], dtype=float)), dtype=float),
+        choi_key: np.asarray(data[choi_key], dtype=complex),
+    }
+    if "partition_in" in data:
+        result["partition_in"] = tuple(int(x) for x in np.asarray(data["partition_in"]).tolist())
+    if "partition_out" in data:
+        result["partition_out"] = tuple(int(x) for x in np.asarray(data["partition_out"]).tolist())
+    if "j2_nu" in data:
+        result["j2_nu"] = int(np.asarray(data["j2_nu"]).item())
+    if "partition_nu" in data:
+        result["partition_nu"] = tuple(int(x) for x in np.asarray(data["partition_nu"]).tolist())
+    if "physical_partition_nu" in data:
+        result["physical_partition_nu"] = tuple(int(x) for x in np.asarray(data["physical_partition_nu"]).tolist())
+    if "nu_matches_physical_ancilla" in data:
+        result["nu_matches_physical_ancilla"] = bool(np.asarray(data["nu_matches_physical_ancilla"]).item())
+    if "exact_formula_mode" in data:
+        result["exact_formula_mode"] = str(np.asarray(data["exact_formula_mode"]).item())
+    for key in [
+        "tp_ok", "tp_error", "prefactor", "lr_coeff",
+        "dim_Sp_in", "dim_Sp_out", "dim_Sp_nu",
+        "dim_V_in", "dim_V_out", "dim_V_nu",
+        "dim_sector_in", "dim_sector_out", "dim_sector_nu",
+    ]:
+        if key in data:
+            arr = np.asarray(data[key])
+            if arr.dtype.kind in ('b',):
+                result[key] = bool(arr.item())
+            elif arr.dtype.kind in ('i', 'u'):
+                result[key] = int(arr.item())
+            else:
+                result[key] = float(arr.item())
+    return result
