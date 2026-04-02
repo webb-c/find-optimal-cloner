@@ -115,9 +115,9 @@ if __name__ == "__main__":
             filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}.npz"
             solver.save_result(filepath)
         elif args.method == "fixed_irrep":
-            filepath = f"data/fixed_irrep/{args.n_in}_to_{args.n_out}_omitted.npz"
             saved = solver.save_all_results()
             print(saved)
+            filepath = ", ".join(saved.values()) if len(saved) > 0 else "(no files saved)"
         else:
             if args.spectrum is not None:
                 filepath = f"data/{args.method}/{args.n_in}_to_{args.n_out}_p={args.spectrum}.npz"

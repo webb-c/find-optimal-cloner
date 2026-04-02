@@ -759,7 +759,7 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
         if self.local_cache_dir is not None:
             save_local_irrep_result(self._cache_path_for_pair(j2_out, j2_in), result, solver.get_solution_blocks())
         
-        result[str((j2_out, j2_in))] = solver.get_solution_blocks()
+        result[block_key(j2_out, j2_in)] = solver.get_solution_blocks()
         return result
 
     def _get_local_result(self, j2_out: int, j2_in: int):
@@ -799,7 +799,7 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
         os.makedirs(self.local_cache_dir, exist_ok=True)
         
         for (j2_out, j2_in), result in self.local_results.items():
-            sol = result[str((j2_out, j2_in))]
+            sol = result[block_key(j2_out, j2_in)]
             save_local_irrep_result(self._cache_path_for_pair(j2_out, j2_in), result, sol)
 
     def make_problem(self):
@@ -814,7 +814,7 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
             for j2_in in self.j2_in_list:
                 y = cp.Variable(nonneg=True)
                 coeff[(j2_out, j2_in)] = y
-                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][str((j2_out, j2_in))], dtype=complex)
+                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][block_key(j2_out, j2_in)], dtype=complex)
                 Jexpr[(j2_out, j2_in)] = y * cp.Constant(J_loc)
 
         for j2_in in self.j2_in_list:
@@ -873,7 +873,7 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
                 if y is None:
                     raise RuntimeError("Solver failed: some coefficient is None")
                 coeff_vals[(j2_out, j2_in)] = float(y)
-                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][str((j2_out, j2_in))], dtype=complex)
+                J_loc = np.asarray(self.local_results[(j2_out, j2_in)][block_key(j2_out, j2_in)], dtype=complex)
                 J_phys = (float(y) / self.mult_out[j2_out]) * J_loc
                 J_blocks[(j2_out, j2_in)] = (J_phys + J_phys.conj().T) / 2.0
         return float(t.value), coeff_vals, J_blocks
@@ -930,7 +930,7 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
     def get_solution(self):
         if self._solution_blocks is None:
             self.solve()
-            J_full = self.blocks_to_full_choi(self._solution_blocks)
+        J_full = self.blocks_to_full_choi(self._solution_blocks)
         return J_full
 
     def get_coefficients(self):
@@ -974,18 +974,25 @@ class SolverGlobalIrrepSDP(SolverSDPPerm):
             "sampled_fidelity": np.array(self._sampled_root_lb ** 2, dtype=float),
         }   
         for k, J in self._solution_blocks.items():
-            save_dict[str(k)] = J
+            save_dict[block_key(*k)] = np.asarray(J, dtype=complex)
             save_dict[f"c_{k}"] = np.array(self._coefficients[k], dtype=float)
         np.savez_compressed(path, **save_dict)
 
 
 class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
     """
-    For a fixed irrep pair lambda -> mu, build every admissible fixed-nu channel
-    T^{nu}_{lambda -> mu}, evaluate its fidelity curve, and optionally save each
-    result in the same .npz format used by save_local_irrep_result().
+    For a fixed irrep pair lambda -> mu, build every fixed auxiliary *local SU(2)
+    sector* available in V_mu \\otimes V_lambda^*. Each sector is indexed by j2_nu,
+    i.e. by the projector label L2 from su2_commutant_projectors().
 
-    Saved result format is intentionally compatible with load_local_irrep_result().
+    Important:
+    This class stores the exact reduced/local ansatz used by the optimizer
+    (J_nu proportional to the corresponding projector sector), not the literal
+    full Schur-space map Pi_mu (X \\otimes Pi_nu) Pi_mu including multiplicity-space
+    factors. In particular, auxiliary labels are no longer restricted to partitions
+    of n_out - n_in boxes. When that physical-size partition exists, it is exposed
+    in the metadata as physical_partition_nu; otherwise a canonical representative
+    partition_nu = (j2_nu,) is used.
     """
     def __init__(self, n_in, n_out, dim=2, verbose=False, p_init_grid=5, p_fine_grid=101, n_rounds=1, irrep_in=None, irrep_out=None, cache_dir="data/fixed_irrep"):
         super().__init__(n_in=n_in, n_out=n_out, dim=dim, verbose=verbose, p_init_grid=p_init_grid, p_fine_grid=p_fine_grid, n_rounds=n_rounds, irrep_in=irrep_in, irrep_out=irrep_out)
@@ -993,27 +1000,24 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
         self.cache_dir = cache_dir
         self.n_anc = self.n_out - self.n_in
 
-        self.j2_nu_list = []
-        self.partition_nu_list = []
-
-        for j2_nu in j2_list_for_n_qubits(self.n_anc):
-            part_nu = j2_to_qubit_partition(self.n_anc, j2_nu)
-            c = lr_coeff_qubit_irreps(self.partition_in, part_nu, self.partition_out)
-            if c != 0:
-                self.j2_nu_list.append(int(j2_nu))
-                self.partition_nu_list.append(tuple(part_nu))
+        self.j2_nu_list = [int(L2) for (L2, _) in self.local_projectors]
+        self.partition_nu_map = {int(j2_nu): tuple(canonical_qubit_aux_partition(j2_nu)) for j2_nu in self.j2_nu_list}
+        self.physical_partition_nu_map = {}
+        for j2_nu in self.j2_nu_list:
+            if j2_nu in j2_list_for_n_qubits(self.n_anc):
+                self.physical_partition_nu_map[int(j2_nu)] = tuple(j2_to_qubit_partition(self.n_anc, j2_nu))
+            else:
+                self.physical_partition_nu_map[int(j2_nu)] = None
 
         self._results_by_j2_nu = None
         self._blocks_by_j2_nu = None
 
     def _normalize_nu_label(self, irrep_nu):
-        """
-        Accept either j2_nu (int) or partition label, return canonical j2_nu.
-        """
+        """Accept either j2_nu (int) or an arbitrary qubit partition label."""
         if isinstance(irrep_nu, (int, np.integer)):
             j2_nu = int(irrep_nu)
         else:
-            j2_nu, _ = parse_qubit_irrep_label(irrep_nu, self.n_anc)
+            j2_nu, _ = parse_auxiliary_qubit_irrep_label(irrep_nu)
 
         if j2_nu not in self.j2_nu_list:
             raise ValueError(
@@ -1027,7 +1031,9 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
         return [
             {
                 "j2_nu": int(j2_nu),
-                "partition_nu": tuple(j2_to_qubit_partition(self.n_anc, j2_nu)),
+                "partition_nu": tuple(self.partition_nu_map[j2_nu]),
+                "physical_partition_nu": self.physical_partition_nu_map[j2_nu],
+                "matches_physical_ancilla": self.physical_partition_nu_map[j2_nu] is not None,
             }
             for j2_nu in self.j2_nu_list
         ]
@@ -1035,22 +1041,20 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
     def _cache_path_for_nu(self, j2_nu: int):
         part_in = str(tuple(self.partition_in)).replace(" ", "")
         part_out = str(tuple(self.partition_out)).replace(" ", "")
-        part_nu = str(tuple(j2_to_qubit_partition(self.n_anc, j2_nu))).replace(" ", "")
+        part_nu = str(tuple(self.partition_nu_map[j2_nu])).replace(" ", "")
         filename = f"{self.n_in}_to_{self.n_out}_{part_in}_to_{part_out}_nu_{part_nu}.npz"
         return os.path.join(self.cache_dir, filename)
-    
+
     def _result_dict_for_fixed_nu(self, j2_nu: int):
-        part_nu = j2_to_qubit_partition(self.n_anc, j2_nu)
         fixed_data = fixed_irrep_channel_local_choi(
             n_in=self.n_in,
             n_out=self.n_out,
             irrep_in=self.partition_in,
             irrep_out=self.partition_out,
-            irrep_nu=part_nu,
+            irrep_nu=self.partition_nu_map[j2_nu],
         )
         J = np.asarray(fixed_data["local_choi"], dtype=complex)
 
-        # sampled lower bound on the coarse grid
         self.p_samples = sorted(set(np.linspace(0.5, 1.0, self.p_init_grid).tolist()))
         sampled_roots = []
         for p in self.p_samples:
@@ -1061,41 +1065,39 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
             sigma = apply_local_choi_numpy(J, rho_in)
             sampled_roots.append(fidelity_root_numpy(rho_out, sigma))
 
-        if len(sampled_roots) == 0:
-            sampled_root_lb = 0.0
-        else:
-            sampled_root_lb = float(np.min(np.asarray(sampled_roots, dtype=float)))
+        sampled_root_lb = 0.0 if len(sampled_roots) == 0 else float(np.min(np.asarray(sampled_roots, dtype=float)))
 
-        # full fidelity curve
         p_curve, root_curve = self.fidelity_curve(J, p_grid=np.linspace(0.5, 1.0, self.p_fine_grid))
         idx = int(np.argmin(root_curve))
         worst_p = float(p_curve[idx])
         worst_root = float(root_curve[idx])
 
         weights = {int(L2): 1.0 if int(L2) == int(j2_nu) else 0.0 for L2 in self.local_basis.keys()}
-        
+
         result = {
             "n_in": int(self.n_in),
             "n_out": int(self.n_out),
             "j2_in": int(self.j2_in),
             "j2_out": int(self.j2_out),
+            "partition_in": tuple(self.partition_in),
+            "partition_out": tuple(self.partition_out),
             "j2_nu": int(j2_nu),
-            "partition_nu": tuple(j2_to_qubit_partition(self.n_anc, j2_nu)),
+            "partition_nu": tuple(fixed_data["partition_nu"]),
+            "physical_partition_nu": fixed_data.get("physical_partition_nu"),
+            "nu_matches_physical_ancilla": bool(fixed_data.get("nu_matches_physical_ancilla", False)),
             "worst_p": float(worst_p),
             "worst_fidelity": float(worst_root ** 2),
+            "sampled_fidelity": float(sampled_root_lb ** 2),
             "weights": weights,
             "local_choi_basis": {int(L2): np.asarray(B, dtype=complex) for L2, B in self.local_basis.items()},
+            "fidelity_curve_p": np.asarray(p_curve, dtype=float),
+            "fidelity_curve_root": np.asarray(root_curve, dtype=float),
         }
-        result[str((self.j2_out, self.j2_in))] = J
+        result[block_key(self.j2_out, self.j2_in)] = J
         return result
 
     def solve(self):
-        """
-        Build all admissible fixed-nu channels.
-        Returns
-        -------
-        dict : j2_nu -> local_choi
-        """
+        """Build all admissible fixed-nu local sectors; returns j2_nu -> local block."""
         if self._blocks_by_j2_nu is not None:
             return self._blocks_by_j2_nu
 
@@ -1106,13 +1108,15 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
             result = self._result_dict_for_fixed_nu(j2_nu)
             results[int(j2_nu)] = result
             blocks[int(j2_nu)] = {
-                (self.j2_out, self.j2_in): np.asarray(result[str((self.j2_out, self.j2_in))], dtype=complex)
+                (self.j2_out, self.j2_in): np.asarray(result[block_key(self.j2_out, self.j2_in)], dtype=complex)
             }
 
             if self.verbose:
+                phys = result.get("physical_partition_nu")
+                phys_msg = f", physical_nu={phys}" if phys is not None else ", physical_nu=None"
                 print(
                     f"[fixed nu] {self.partition_in} -> {self.partition_out}, "
-                    f"nu={result['partition_nu']}"
+                    f"nu={result['partition_nu']} (j2={j2_nu}){phys_msg}, "
                     f"worst F≈{result['worst_fidelity']:.8f}"
                 )
 
@@ -1138,7 +1142,7 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
     def get_result_by_partition_nu(self):
         self.solve()
         return {
-            tuple(j2_to_qubit_partition(self.n_anc, j2_nu)): result
+            tuple(self.partition_nu_map[j2_nu]): result
             for j2_nu, result in self._results_by_j2_nu.items()
         }
 
@@ -1148,7 +1152,7 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
         result = self._results_by_j2_nu[j2_nu]
         if path is None:
             path = self._cache_path_for_nu(j2_nu)
-        save_local_irrep_result(path, result)
+        save_local_irrep_result(path, result, result[block_key(self.j2_out, self.j2_in)])
         return path
 
     def save_all_results(self):
@@ -1159,7 +1163,7 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
         saved = {}
         for j2_nu in self.j2_nu_list:
             path = self._cache_path_for_nu(j2_nu)
-            save_local_irrep_result(path, self._results_by_j2_nu[j2_nu], self._results_by_j2_nu[j2_nu][str((self.j2_out, self.j2_in))])
+            save_local_irrep_result(path, self._results_by_j2_nu[j2_nu], self._results_by_j2_nu[j2_nu][block_key(self.j2_out, self.j2_in)])
             saved[j2_nu] = path
         return saved
 
@@ -1167,13 +1171,13 @@ class SolverFixedIrrepFamily(SolverLocalIrrepSDP):
         self.solve()
         lines = []
         lines.append(
-            f"Fixed-nu family for input {self.partition_in} (j2={self.j2_in}) "
+            f"Fixed-nu local-sector family for input {self.partition_in} (j2={self.j2_in}) "
             f"-> output {self.partition_out} (j2={self.j2_out})"
         )
         for j2_nu in self.j2_nu_list:
             result = self._results_by_j2_nu[j2_nu]
             lines.append(
-                f"  nu={result['partition_nu']} (j2={j2_nu}): "
+                f"  nu={result['partition_nu']} (j2={j2_nu}, physical={result.get('physical_partition_nu')}): "
                 f"worst_F≈{result['worst_fidelity']:.10f}, "
                 f"worst_p≈{result['worst_p']:.10f}"
             )

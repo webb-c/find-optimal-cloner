@@ -7,6 +7,10 @@ from math import comb
 from typing import List, Tuple, Union
 
 
+def block_key(jout: int, jin: int) -> str:
+    return str((int(jout), int(jin)))
+
+
 def spin_matrices_from_j2(j2: int):
     j = j2 / 2.0
     d = j2 + 1
@@ -154,19 +158,8 @@ def rho_tensor_power(rho, n):
     return out
 
 def fidelity_root(rho, sigma, eps=1e-12):
-    rho = (rho + rho.conj().T) / 2
-    sigma = (sigma + sigma.conj().T) / 2
-
-    w, v = np.linalg.eigh(rho)
-    w = np.clip(w, 0, None)
-    sqrt_rho = (v * np.sqrt(w)) @ v.conj().T
-
-    A = sqrt_rho @ sigma @ sqrt_rho
-    A = (A + A.conj().T) / 2
-
-    w2, _ = np.linalg.eigh(A)
-    w2 = np.clip(w2, 0, None)
-    return float(np.sum(np.sqrt(w2)).real)
+    """Backward-compatible alias for fidelity_root_numpy()."""
+    return fidelity_root_numpy(rho, sigma)
 
 def apply_choi_numpy(J, rho, d_out, d_in):
     J4 = J.reshape(d_out, d_in, d_out, d_in)
@@ -179,7 +172,7 @@ def apply_choi_numpy(J, rho, d_out, d_in):
     return sigma
 
 def save_choi_blocks(filename: str, j_blocks: dict):
-    save_dict = {str(k): v for k, v in j_blocks.items()}
+    save_dict = {block_key(*k): np.asarray(v, dtype=complex) for k, v in j_blocks.items()}
     np.savez_compressed(filename, **save_dict)
 
 
@@ -254,6 +247,54 @@ def parse_qubit_irrep_label(label, n: int):
     return j2, normalize_partition(list(parts), n)
 
 
+def parse_auxiliary_qubit_irrep_label(label):
+    """
+    Parse a qubit irrep label without fixing the total number of boxes.
+    This is useful for auxiliary irreps, where only the SU(2) spin label j2
+    matters in the reduced/local ansatz.
+    """
+    if isinstance(label, int):
+        j2 = int(label)
+        if j2 < 0:
+            raise ValueError("j2 must be nonnegative.")
+        return j2, canonical_qubit_aux_partition(j2)
+
+    if isinstance(label, (tuple, list)):
+        parts = tuple(int(x) for x in label)
+        n = int(sum(parts))
+        if n <= 0:
+            raise ValueError("Auxiliary partition must contain at least one box.")
+        partition = normalize_partition(parts, n)
+        return int(partition[0] - (partition[1] if len(partition) > 1 else 0)), partition
+
+    s = str(label).strip().replace(" ", "")
+    if len(s) == 0:
+        raise ValueError("Irrep label cannot be empty.")
+
+    if s.startswith("j2="):
+        j2 = int(s.split("=", 1)[1])
+        if j2 < 0:
+            raise ValueError("j2 must be nonnegative.")
+        return j2, canonical_qubit_aux_partition(j2)
+
+    nums = [int(x) for x in re.findall(r"\d+", s)]
+    if len(nums) == 0:
+        raise ValueError(f"Could not parse auxiliary irrep label: {label!r}")
+    if len(nums) == 1 and s.isdigit():
+        j2 = nums[0]
+        return j2, canonical_qubit_aux_partition(j2)
+
+    partition = normalize_partition(nums, int(sum(nums)))
+    return int(partition[0] - (partition[1] if len(partition) > 1 else 0)), partition
+
+
+def canonical_qubit_aux_partition(j2: int):
+    j2 = int(j2)
+    if j2 < 0:
+        raise ValueError("j2 must be nonnegative.")
+    return (j2,) if j2 > 0 else (1, 1)
+
+
 def normalized_spin_irrep_state(n: int, j2: int, p: float, tol: float = 1e-12):
     p = float(p)
     block = rho_block_diag_in_spin_irrep(n, j2, p)
@@ -294,19 +335,30 @@ def local_irrep_result_to_dict(solver):
         "n_out": int(solver.n_out),
         "j2_in": int(solver.j2_in),
         "j2_out": int(solver.j2_out),
+        "partition_in": tuple(solver.partition_in),
+        "partition_out": tuple(solver.partition_out),
         "worst_p": float(solver._worst_p),
         "worst_fidelity": float(solver._worst_root_fidelity ** 2),
         "sampled_fidelity": float(solver._sampled_root_lb ** 2),
         "weights": {int(L2): float(val) for L2, val in solver._weights.items()},
         "local_choi_basis": {int(L2): np.asarray(J, dtype=complex) for L2, J in solver.local_basis.items()},
         "fidelity_curve_p": np.asarray(solver._fidelity_curve_p, dtype=float),
+        "fidelity_curve_root": np.asarray(solver._fidelity_curve_root, dtype=float),
     }
+    result[block_key(result["j2_out"], result["j2_in"])] = np.asarray(solver.get_solution_blocks(), dtype=complex)
     return result
 
-def save_local_irrep_result(path: str, result: dict, J: None):
+def save_local_irrep_result(path: str, result: dict, J=None):
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
+
+    choi_key = block_key(result["j2_out"], result["j2_in"])
+    if J is None:
+        if choi_key not in result:
+            raise ValueError(f"Missing Choi block '{choi_key}' in result and no explicit J was provided.")
+        J = result[choi_key]
+
     save_dict = {
         "n_in": np.array(result["n_in"], dtype=int),
         "n_out": np.array(result["n_out"], dtype=int),
@@ -315,47 +367,76 @@ def save_local_irrep_result(path: str, result: dict, J: None):
         "worst_p": np.array(result["worst_p"], dtype=float),
         "worst_fidelity": np.array(result["worst_fidelity"], dtype=float),
         "sampled_fidelity": np.array(result.get("sampled_fidelity", 0.0), dtype=float),
+        choi_key: np.asarray(J, dtype=complex),
     }
-    if "fidelity_curve_p" in result.keys():
+    if "partition_in" in result:
+        save_dict["partition_in"] = np.asarray(result["partition_in"], dtype=int)
+    if "partition_out" in result:
+        save_dict["partition_out"] = np.asarray(result["partition_out"], dtype=int)
+    if "j2_nu" in result:
+        save_dict["j2_nu"] = np.array(result["j2_nu"], dtype=int)
+    if "partition_nu" in result:
+        save_dict["partition_nu"] = np.asarray(result["partition_nu"], dtype=int)
+    if "physical_partition_nu" in result and result["physical_partition_nu"] is not None:
+        save_dict["physical_partition_nu"] = np.asarray(result["physical_partition_nu"], dtype=int)
+    if "nu_matches_physical_ancilla" in result:
+        save_dict["nu_matches_physical_ancilla"] = np.array(bool(result["nu_matches_physical_ancilla"]))
+    if "fidelity_curve_p" in result:
         save_dict["fidelity_curve_p"] = np.asarray(result["fidelity_curve_p"], dtype=float)
+    if "fidelity_curve_root" in result:
+        save_dict["fidelity_curve_root"] = np.asarray(result["fidelity_curve_root"], dtype=float)
 
-    save_dict[str((result["j2_out"], result["j2_in"]))] = J
-    
-
-    # Description about the final choi map represented with basis matrix and weights.
     for L2, val in result.get("weights", {}).items():
         save_dict[f"weight_L2_{int(L2)}"] = np.array(float(val), dtype=float)
-    for L2, J in result.get("local_choi_basis", {}).items():
-        save_dict[f"basis_L2_{int(L2)}"] = np.asarray(J, dtype=complex)
+    for L2, B in result.get("local_choi_basis", {}).items():
+        save_dict[f"basis_L2_{int(L2)}"] = np.asarray(B, dtype=complex)
     np.savez_compressed(path, **save_dict)
 
 
 def load_local_irrep_result(path: str):
     raw = np.load(path, allow_pickle=True)
     data = {k: raw[k] for k in raw.files}
-    
+
+    j2_out = int(np.asarray(data["j2_out"]).item())
+    j2_in = int(np.asarray(data["j2_in"]).item())
+    choi_key = block_key(j2_out, j2_in)
+
     weights = {}
     basis = {}
     for k, v in data.items():
         if k.startswith("weight_L2_"):
             weights[int(k.split("_")[-1])] = float(np.asarray(v).item())
-        elif k.startswith("basis_choi_L2_"):
+        elif k.startswith("basis_L2_"):
             basis[int(k.split("_")[-1])] = np.asarray(v)
-    return {
+
+    result = {
         "n_in": int(np.asarray(data["n_in"]).item()),
         "n_out": int(np.asarray(data["n_out"]).item()),
-        "j2_in": int(np.asarray(data["j2_in"]).item()),
-        "j2_out": int(np.asarray(data["j2_out"]).item()),
-        "p_samples": np.asarray(data.get("p_samples", np.array([], dtype=float)), dtype=float),
+        "j2_in": j2_in,
+        "j2_out": j2_out,
         "worst_p": float(np.asarray(data.get("worst_p", 1.0)).item()),
         "worst_fidelity": float(np.asarray(data.get("worst_fidelity", 0.0)).item()),
         "weights": weights,
         "local_choi_basis": basis,
         "sampled_fidelity": float(np.asarray(data.get("sampled_fidelity", 0.0)).item()),
         "fidelity_curve_p": np.asarray(data.get("fidelity_curve_p", np.array([], dtype=float)), dtype=float),
-        f"({data['j2_out']}, {data['j2_in']})": data[str((data['j2_out'], data['j2_in']))]
+        "fidelity_curve_root": np.asarray(data.get("fidelity_curve_root", np.array([], dtype=float)), dtype=float),
+        choi_key: np.asarray(data[choi_key], dtype=complex),
     }
-    
+    if "partition_in" in data:
+        result["partition_in"] = tuple(int(x) for x in np.asarray(data["partition_in"]).tolist())
+    if "partition_out" in data:
+        result["partition_out"] = tuple(int(x) for x in np.asarray(data["partition_out"]).tolist())
+    if "j2_nu" in data:
+        result["j2_nu"] = int(np.asarray(data["j2_nu"]).item())
+    if "partition_nu" in data:
+        result["partition_nu"] = tuple(int(x) for x in np.asarray(data["partition_nu"]).tolist())
+    if "physical_partition_nu" in data:
+        result["physical_partition_nu"] = tuple(int(x) for x in np.asarray(data["physical_partition_nu"]).tolist())
+    if "nu_matches_physical_ancilla" in data:
+        result["nu_matches_physical_ancilla"] = bool(np.asarray(data["nu_matches_physical_ancilla"]).item())
+    return result
+
 def partition_n_boxes(partition):
     return int(sum(int(x) for x in partition))
 
@@ -399,32 +480,32 @@ def lr_coeff_qubit_irreps(part_lambda, part_nu, part_mu):
 
 def fixed_irrep_channel_local_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
     """
-    Build the reduced/local Choi matrix for the fixed-irrep channel
-    T_{lambda -> mu}^nu in the same local spin-irrep picture used by your code.
+    Build the reduced/local Choi matrix for a fixed auxiliary SU(2) sector.
 
-    Returns a dict containing metadata + local_choi.
+    Important:
+    - This helper constructs the *local projector ansatz* used by the optimizer,
+      namely J_nu \\propto Pi_{L2=j2_nu} on V_mu \\otimes V_lambda^*.
+    - It does *not* literally build the full Schur-space operator
+          Pi_mu (X \\otimes Pi_nu) Pi_mu
+      together with multiplicity-space factors such as dim Sp_nu.
+    - Therefore the only part of the auxiliary label that matters here is j2_nu.
+      The partition returned in the metadata is just a canonical representative
+      (or the user-supplied representative) of that SU(2) irrep sector.
     """
     if n_out < n_in:
         raise ValueError("Need n_out >= n_in.")
 
     n_anc = n_out - n_in
 
-    j2_in, part_in   = parse_qubit_irrep_label(irrep_in, n_in)
+    j2_in, part_in = parse_qubit_irrep_label(irrep_in, n_in)
     j2_out, part_out = parse_qubit_irrep_label(irrep_out, n_out)
-    j2_nu, part_nu   = parse_qubit_irrep_label(irrep_nu, n_anc)
-
-    c = lr_coeff_qubit_irreps(part_in, part_nu, part_out)
-    if c == 0:
-        raise ValueError(
-            f"LR coefficient is zero: "
-            f"lambda={part_in}, nu={part_nu}, mu={part_out}"
-        )
+    j2_nu, part_nu = parse_auxiliary_qubit_irrep_label(irrep_nu)
 
     local_projectors = su2_commutant_projectors(j2_out, j2_in)
 
     chosen = None
     for (L2, Pi) in local_projectors:
-        if L2 != j2_nu:
+        if int(L2) != int(j2_nu):
             continue
 
         d_in = j2_in + 1
@@ -435,69 +516,36 @@ def fixed_irrep_channel_local_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
         if alpha <= 0:
             raise RuntimeError(f"Invalid normalization for L2={L2}.")
 
-        # qubit case: c is 0 or 1
-        J = Pi / (c * alpha)
+        J = Pi / alpha
         J = (J + J.conj().T) / 2.0
         chosen = J
         break
 
     if chosen is None:
+        allowed = [int(L2) for (L2, _) in local_projectors]
         raise ValueError(
-            f"No matching projector found for j2_nu={j2_nu} "
-            f"(j2_in={j2_in}, j2_out={j2_out})."
+            f"No matching local projector sector found for j2_nu={j2_nu} "
+            f"(j2_in={j2_in}, j2_out={j2_out}). Allowed j2_nu values: {allowed}"
         )
+
+    physical_partition_nu = None
+    lr_coeff = None
+    if j2_nu in j2_list_for_n_qubits(n_anc):
+        physical_partition_nu = tuple(j2_to_qubit_partition(n_anc, j2_nu))
+        lr_coeff = lr_coeff_qubit_irreps(part_in, physical_partition_nu, part_out)
 
     return {
         "n_in": int(n_in),
         "n_out": int(n_out),
+        "n_anc": int(n_anc),
         "j2_in": int(j2_in),
         "j2_out": int(j2_out),
         "j2_nu": int(j2_nu),
         "partition_in": tuple(part_in),
         "partition_out": tuple(part_out),
         "partition_nu": tuple(part_nu),
-        "lr_coeff": int(c),
+        "physical_partition_nu": physical_partition_nu,
+        "nu_matches_physical_ancilla": physical_partition_nu is not None and tuple(part_nu) == tuple(physical_partition_nu),
+        "lr_coeff_physical_ancilla": None if lr_coeff is None else int(lr_coeff),
         "local_choi": np.asarray(chosen, dtype=complex),
     }
-
-
-def fixed_irrep_channel_blocks(n_in, n_out, irrep_in, irrep_out, irrep_nu):
-    data = fixed_irrep_channel_local_choi(
-        n_in=n_in,
-        n_out=n_out,
-        irrep_in=irrep_in,
-        irrep_out=irrep_out,
-        irrep_nu=irrep_nu,
-    )
-    return {(data["j2_out"], data["j2_in"]): data["local_choi"]}
-
-
-def fixed_irrep_channel_full_choi(n_in, n_out, irrep_in, irrep_out, irrep_nu):
-    """
-    Lift the local/reduced Choi matrix to the full computational-basis Choi matrix
-    using your existing SolverSDPPerm.blocks_to_full_choi().
-    """
-    data = fixed_irrep_channel_local_choi(
-        n_in=n_in,
-        n_out=n_out,
-        irrep_in=irrep_in,
-        irrep_out=irrep_out,
-        irrep_nu=irrep_nu,
-    )
-
-    helper = SolverSDPPerm(
-        n_in=n_in,
-        n_out=n_out,
-        dim=2,
-        verbose=False,
-        p_init_grid=3,
-        p_fine_grid=11,
-        n_rounds=1,
-    )
-
-    J_blocks = {(data["j2_out"], data["j2_in"]): data["local_choi"]}
-    J_full = helper.blocks_to_full_choi(J_blocks)
-
-    out = dict(data)
-    out["full_choi"] = J_full
-    return out
